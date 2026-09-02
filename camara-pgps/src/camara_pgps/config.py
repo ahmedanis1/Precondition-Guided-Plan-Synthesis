@@ -58,6 +58,12 @@ class GraphSettings(BaseModel):
     path: Path = Path("data/knowledge_graph.gml")
 
 
+class RegistrySettings(BaseModel):
+    """Local CAMARA API registry (authoritative source of executable APIs)."""
+
+    path: Path = Path("data/registry/camara_apis.json")
+
+
 class CamaraSettings(BaseModel):
     """Target CAMARA gateway (real deployment or the bundled mock)."""
 
@@ -107,6 +113,7 @@ class Settings(BaseSettings):
     embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     vector_store: VectorStoreSettings = Field(default_factory=VectorStoreSettings)
     graph: GraphSettings = Field(default_factory=GraphSettings)
+    registry: RegistrySettings = Field(default_factory=RegistrySettings)
     camara: CamaraSettings = Field(default_factory=CamaraSettings)
     mock_camara: MockCamaraSettings = Field(default_factory=MockCamaraSettings)
     server: ServerSettings = Field(default_factory=ServerSettings)
