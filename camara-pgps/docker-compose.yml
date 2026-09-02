@@ -1,0 +1,34 @@
+# Development stack for camara-pgps.
+#
+# Convenience only - the primary local workflow is the conda environment
+# (see environment.yml). Service commands install the project in editable mode
+# on start, so the first boot is slow. The `mock_camara.app` and
+# `camara_pgps.api` targets are implemented in later milestones.
+
+services:
+  mock-camara:
+    image: python:3.11-slim
+    working_dir: /app
+    command: sh -c "pip install -e . && python -m uvicorn mock_camara.app:app --host 0.0.0.0 --port 8080"
+    volumes:
+      - .:/app
+    ports:
+      - "8080:8080"
+    environment:
+      CAMARA_PGPS_MOCK_CAMARA__HOST: "0.0.0.0"
+      CAMARA_PGPS_MOCK_CAMARA__PORT: "8080"
+
+  api:
+    image: python:3.11-slim
+    working_dir: /app
+    command: sh -c "pip install -e . && python -m uvicorn camara_pgps.api:app --host 0.0.0.0 --port 8000"
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env.example
+    environment:
+      CAMARA_PGPS_CAMARA__BASE_URL: "http://mock-camara:8080"
+    depends_on:
+      - mock-camara

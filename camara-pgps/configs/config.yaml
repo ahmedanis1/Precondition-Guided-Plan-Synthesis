@@ -1,0 +1,40 @@
+# Default configuration for camara-pgps.
+#
+# Values here are the lowest-precedence layer above the code defaults. Override
+# any of them with CAMARA_PGPS_* environment variables or a local .env file
+# (see .env.example). Point CAMARA_PGPS_CONFIG at another file to swap this out.
+
+environment: development
+debug: false
+log_level: INFO
+
+llm:
+  provider: anthropic
+  model: claude-sonnet-5
+  temperature: 0.0
+
+embedding:
+  model_name: sentence-transformers/all-MiniLM-L6-v2
+  device: cpu
+
+vector_store:
+  persist_directory: data/chroma
+  collection_name: camara_specs
+
+graph:
+  path: data/knowledge_graph.gml
+
+camara:
+  base_url: http://localhost:8080
+
+mock_camara:
+  host: 0.0.0.0
+  port: 8080
+
+server:
+  host: 0.0.0.0
+  port: 8000
+  reload: false
+
+mcp:
+  enabled: false

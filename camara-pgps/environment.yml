@@ -1,0 +1,19 @@
+# Conda environment for camara-pgps.
+#
+#   conda env create -f environment.yml
+#   conda activate camara-pgps
+#
+# Conda provides the interpreter; all Python packages come from pyproject.toml
+# so there is a single source of dependency truth. Re-run after dependency
+# changes with:  conda env update -f environment.yml --prune
+
+name: camara-pgps
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - -e .[dev]
