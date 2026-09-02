@@ -39,10 +39,16 @@ class LLMSettings(BaseModel):
 
 
 class EmbeddingSettings(BaseModel):
-    """sentence-transformers embedding configuration."""
+    """Embedding backend configuration.
 
+    ``provider`` selects the implementation: ``sentence-transformers`` (default)
+    or ``hash`` (a deterministic, dependency-free embedder for offline use / tests).
+    """
+
+    provider: str = "sentence-transformers"
     model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     device: str = "cpu"
+    batch_size: int = 32
 
 
 class VectorStoreSettings(BaseModel):
@@ -50,6 +56,7 @@ class VectorStoreSettings(BaseModel):
 
     persist_directory: Path = Path("data/chroma")
     collection_name: str = "camara_specs"
+    distance: str = "cosine"
 
 
 class GraphSettings(BaseModel):
