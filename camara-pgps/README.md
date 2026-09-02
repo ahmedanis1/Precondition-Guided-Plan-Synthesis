@@ -24,7 +24,7 @@ plan is validated and executed against a CAMARA gateway (or the bundled mock).
 | 7 | Intent Understanding | ✅ done |
 | 8 | API Selection | ✅ done |
 | 9 | Parameter Extraction | ✅ done |
-| 10 | PGPS Dependency Model | ⬜ planned |
+| 10 | PGPS Dependency Model | ✅ done |
 | 11 | PGPS Planner | ⬜ planned |
 | 12 | Plan Validator | ⬜ planned |
 | 13 | Execution Layer | ⬜ planned |
@@ -88,7 +88,8 @@ camara-pgps/
 │   ├── models/          shared domain models (intent, api, plan, state, …)
 │   ├── camara/          API registry, capability mapper & OpenAPI parser
 │   ├── retrieval/       ingestion, embeddings, ChromaDB retriever, RAG retrieval
-│   └── agents/          LLM agents (intent understanding, …)
+│   ├── agents/          LLM agents (intent, API selection, parameter extraction)
+│   └── pgps/            condition model & fact-flow dependency graph
 ├── configs/             YAML configuration defaults
 ├── data/                local artefacts (vector store, knowledge graph) - gitignored
 │   └── registry/        camara_apis.json - the local API registry (tracked)
