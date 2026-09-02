@@ -24,6 +24,14 @@ from camara_pgps.retrieval.ingestion import (
     IngestionResult,
     run_ingestion,
 )
+from camara_pgps.retrieval.rag import (
+    RagContext,
+    RagRetriever,
+    RetrievedCondition,
+    RetrievedOperation,
+    RetrievedParameter,
+    get_rag_retriever,
+)
 from camara_pgps.retrieval.retriever import (
     Retriever,
     VectorMatch,
@@ -54,4 +62,10 @@ __all__ = [
     "VectorMatch",
     "VectorStore",
     "get_retriever",
+    "RagRetriever",
+    "RagContext",
+    "RetrievedOperation",
+    "RetrievedParameter",
+    "RetrievedCondition",
+    "get_rag_retriever",
 ]
