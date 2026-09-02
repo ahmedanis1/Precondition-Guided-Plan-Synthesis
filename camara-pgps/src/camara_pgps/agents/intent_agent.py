@@ -17,15 +17,14 @@ Two parsers:
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 import re
 from functools import lru_cache
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
+from camara_pgps.agents._llm import build_chat_model, chat_content, extract_json
 from camara_pgps.camara.registry import CamaraRegistry
 from camara_pgps.config import Settings, get_settings
 from camara_pgps.models import Intent, IntentEntity
@@ -173,19 +172,8 @@ def _family_of(capability: str) -> str:
     return capability.split(".", 1)[0]
 
 
-def _extract_json(raw: str) -> dict[str, Any]:
-    text = raw.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```[a-zA-Z0-9]*\n?", "", text)
-        text = re.sub(r"\n?```$", "", text).strip()
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end < start:
-        raise ValueError("no JSON object found in model response")
-    data = json.loads(text[start : end + 1])
-    if not isinstance(data, dict):
-        raise ValueError("model response JSON is not an object")
-    return data
+# Re-exported for callers/tests that import it from this module.
+_extract_json = extract_json
 
 
 # --------------------------------------------------------------------------- #
@@ -324,7 +312,7 @@ class LLMIntentParser:
     def parse(self, text: str) -> IntentDraft:
         try:
             raw = self._invoke(text)
-            return IntentDraft.model_validate(_extract_json(raw))
+            return IntentDraft.model_validate(extract_json(raw))
         except Exception as exc:  # noqa: BLE001 - any failure must degrade gracefully
             logger.warning("LLM intent parse failed (%s); using rule-based parser", exc)
             return self._fallback.parse(text)
@@ -337,60 +325,12 @@ class LLMIntentParser:
         response = self._model.invoke(
             [SystemMessage(content=system), HumanMessage(content=text)]
         )
-        content = getattr(response, "content", response)
-        if isinstance(content, list):  # some chat models return content blocks
-            content = " ".join(
-                block.get("text", "") if isinstance(block, dict) else str(block)
-                for block in content
-            )
-        return str(content)
+        return chat_content(response)
 
 
 # --------------------------------------------------------------------------- #
 # agent
 # --------------------------------------------------------------------------- #
-
-def _maybe_build_chat_model(settings: Settings) -> Any | None:
-    provider = (settings.llm.provider or "").lower()
-    if provider in {"", "rule", "rules", "heuristic", "none", "off"}:
-        return None
-    api_key = (
-        settings.llm.api_key
-        or os.environ.get("ANTHROPIC_API_KEY")
-        or os.environ.get("OPENAI_API_KEY")
-    )
-    if not api_key:
-        logger.info("no LLM API key configured; intent agent will use rule-based parsing")
-        return None
-    try:
-        if provider == "anthropic":
-            from langchain_anthropic import ChatAnthropic
-
-            return ChatAnthropic(
-                model=settings.llm.model,
-                temperature=settings.llm.temperature,
-                timeout=60,
-                stop=None,
-                api_key=api_key,
-            )
-        if provider in {"openai", "azure-openai"}:
-            from langchain_openai import ChatOpenAI
-
-            return ChatOpenAI(
-                model=settings.llm.model,
-                temperature=settings.llm.temperature,
-                api_key=api_key,
-            )
-    except ImportError as exc:
-        logger.warning(
-            "LLM provider %r is not installed (%s); using rule-based intent parsing",
-            provider,
-            exc,
-        )
-        return None
-    logger.warning("unsupported LLM provider %r; using rule-based intent parsing", provider)
-    return None
-
 
 class IntentAgent:
     """Natural language -> structured :class:`Intent`."""
@@ -415,7 +355,10 @@ class IntentAgent:
     @classmethod
     def from_settings(cls, settings: Settings | None = None) -> IntentAgent:
         settings = settings or get_settings()
-        return cls(llm=_maybe_build_chat_model(settings), settings=settings)
+        return cls(
+            llm=build_chat_model(settings, purpose="intent agent"),
+            settings=settings,
+        )
 
     # -- public --------------------------------------------------------------
 

@@ -22,7 +22,7 @@ plan is validated and executed against a CAMARA gateway (or the bundled mock).
 | 5 | CAMARA Knowledge Ingestion Pipeline | ✅ done |
 | 6 | RAG Retrieval | ✅ done |
 | 7 | Intent Understanding | ✅ done |
-| 8 | API Selection | ⬜ planned |
+| 8 | API Selection | ✅ done |
 | 9 | Parameter Extraction | ⬜ planned |
 | 10 | PGPS Dependency Model | ⬜ planned |
 | 11 | PGPS Planner | ⬜ planned |
