@@ -1,0 +1,172 @@
+openapi: 3.0.3
+info:
+  title: Quality On Demand
+  version: 0.11.0
+  description: >-
+    Compact CAMARA-style Quality-on-Demand spec used to exercise the OpenAPI
+    parser. Not the real CAMARA document.
+servers:
+  - url: "{apiRoot}/quality-on-demand/v0.11"
+    variables:
+      apiRoot:
+        default: https://localhost:9091
+tags:
+  - name: QoS sessions
+security:
+  - openId:
+      - quality-on-demand:sessions:read
+paths:
+  /sessions:
+    post:
+      operationId: createSession
+      summary: Create a QoS session
+      description: Requests a QoS session with a chosen profile.
+      tags:
+        - QoS sessions
+      security:
+        - openId:
+            - quality-on-demand:sessions:create
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSession"
+            example:
+              qosProfile: QOS_E
+              duration: 3600
+      responses:
+        "201":
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionInfo"
+              example:
+                sessionId: 1234-abcd
+                qosStatus: REQUESTED
+        "400":
+          $ref: "#/components/responses/Generic400"
+        "401":
+          description: Unauthenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorInfo"
+        "429":
+          description: Too many requests
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorInfo"
+  /sessions/{sessionId}:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      operationId: getSession
+      summary: Get QoS session information
+      responses:
+        "200":
+          description: Session found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionInfo"
+        "404":
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorInfo"
+    delete:
+      operationId: deleteSession
+      summary: Delete a QoS session
+      responses:
+        "204":
+          description: Session deleted
+        "404":
+          description: Session not found
+components:
+  securitySchemes:
+    openId:
+      type: openIdConnect
+      openIdConnectUrl: https://example.com/.well-known/openid-configuration
+  parameters:
+    SessionId:
+      name: sessionId
+      in: path
+      required: true
+      description: Identifier of the QoS session
+      schema:
+        type: string
+        format: uuid
+  responses:
+    Generic400:
+      description: Invalid input
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorInfo"
+  schemas:
+    CreateSession:
+      type: object
+      required:
+        - device
+        - qosProfile
+        - duration
+      properties:
+        device:
+          $ref: "#/components/schemas/Device"
+        applicationServer:
+          type: object
+          description: Address of the application server
+        qosProfile:
+          type: string
+          description: Name of the requested QoS profile
+          enum:
+            - QOS_E
+            - QOS_S
+            - QOS_M
+            - QOS_L
+        duration:
+          type: integer
+          minimum: 1
+          maximum: 86400
+          description: Session duration in seconds
+    Device:
+      type: object
+      properties:
+        phoneNumber:
+          type: string
+          example: "+123456789"
+        networkAccessIdentifier:
+          type: string
+    SessionInfo:
+      allOf:
+        - $ref: "#/components/schemas/CreateSession"
+        - type: object
+          required:
+            - sessionId
+          properties:
+            sessionId:
+              type: string
+              format: uuid
+            qosStatus:
+              type: string
+              enum:
+                - REQUESTED
+                - AVAILABLE
+                - UNAVAILABLE
+    ErrorInfo:
+      type: object
+      required:
+        - status
+        - code
+        - message
+      properties:
+        status:
+          type: integer
+        code:
+          type: string
+        message:
+          type: string

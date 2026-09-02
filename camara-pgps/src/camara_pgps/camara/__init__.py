@@ -6,6 +6,13 @@ from camara_pgps.camara.capability_mapper import (
     InvalidCapabilityError,
     UnknownCapabilityError,
 )
+from camara_pgps.camara.openapi_parser import (
+    OpenAPIParseError,
+    OpenAPIParser,
+    build_registry,
+    build_registry_document,
+    parse_openapi,
+)
 from camara_pgps.camara.registry import (
     CamaraRegistry,
     DuplicateEntryError,
@@ -19,6 +26,8 @@ from camara_pgps.camara.schemas import (
     RegistryAPI,
     RegistryDocument,
     RegistryOperation,
+    ResponseSpec,
+    SourceRef,
     SourceType,
 )
 
@@ -33,6 +42,16 @@ __all__ = [
     "CapabilityError",
     "InvalidCapabilityError",
     "UnknownCapabilityError",
+    "OpenAPIParser",
+    "OpenAPIParseError",
+    "parse_openapi",
+    "build_registry",
+    "build_registry_document",
+    "RegistryDocument",
+    "RegistryAPI",
+    "RegistryOperation",
+    "ResponseSpec",
+    "SourceRef",
     "RegistryDocument",
     "RegistryAPI",
     "RegistryOperation",
