@@ -16,8 +16,9 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from camara_pgps.models import CamaraAPI, CamaraOperation
 
@@ -35,15 +36,47 @@ class Provenance(BaseModel):
 
     source_type: SourceType
     location: str
+    source_url: str | None = None
     spec_version: str | None = None
     retrieved_at: datetime | None = None
     note: str | None = None
 
 
+class SourceRef(BaseModel):
+    """Back-reference stamped on every parsed operation.
+
+    Lets the RAG layer explain where an API, operation or parameter came from
+    (which document, which upstream URL, which spec version).
+    """
+
+    api_name: str
+    version: str
+    operation_id: str | None = None
+    source: str | None = None
+    source_url: str | None = None
+
+
+class ResponseSpec(BaseModel):
+    """One response entry of an operation (success or error)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    status_code: str
+    description: str | None = None
+    schema_: dict[str, Any] | None = Field(default=None, alias="schema")
+    is_error: bool = False
+
+
 class RegistryOperation(CamaraOperation):
-    """A registry operation entry: a :class:`CamaraOperation` plus its capability."""
+    """A registry operation entry: a :class:`CamaraOperation` plus registry-owned
+    metadata (capability tag, responses/errors, examples and provenance)."""
 
     capability: str | None = None
+    deprecated: bool = False
+    responses: list[ResponseSpec] = Field(default_factory=list)
+    errors: list[ResponseSpec] = Field(default_factory=list)
+    examples: dict[str, Any] = Field(default_factory=dict)
+    source: SourceRef | None = None
 
 
 class RegistryAPI(CamaraAPI):
