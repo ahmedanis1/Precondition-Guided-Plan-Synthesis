@@ -171,7 +171,9 @@
               "location": "body",
               "required": true,
               "description": "Name of the QoS profile to apply.",
-              "schema": {"type": "string"}
+              "schema": {"type": "string"},
+              "enum": ["QOS_E", "QOS_S", "QOS_M", "QOS_L"],
+              "example": "QOS_L"
             },
             {
               "name": "duration",
