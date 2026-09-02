@@ -14,12 +14,15 @@ llm:
   temperature: 0.0
 
 embedding:
+  provider: sentence-transformers
   model_name: sentence-transformers/all-MiniLM-L6-v2
   device: cpu
+  batch_size: 32
 
 vector_store:
   persist_directory: data/chroma
   collection_name: camara_specs
+  distance: cosine
 
 graph:
   path: data/knowledge_graph.gml
