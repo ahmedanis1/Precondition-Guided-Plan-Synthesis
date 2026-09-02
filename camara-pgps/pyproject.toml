@@ -81,3 +81,8 @@ strict = true
 # graceful ImportError fallback.
 module = ["langchain_anthropic.*", "langchain_openai.*"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# networkx ships no type stubs.
+module = ["networkx.*"]
+ignore_missing_imports = true
