@@ -26,7 +26,15 @@ class IntentEntity(BaseModel):
 
 
 class Intent(BaseModel):
-    """A structured interpretation of what the user wants to achieve."""
+    """A structured interpretation of what the user wants to achieve.
+
+    ``required_capabilities`` / ``known_facts`` / ``missing_information`` are
+    populated by the Intent Understanding agent (milestone 7). They describe *what*
+    is needed, not *how* or *in what order* - the agent never decides an execution
+    plan. ``required_capabilities`` come from a closed vocabulary (the CAMARA
+    capability families); ``known_facts`` / ``missing_information`` use the shared
+    fact-key convention (e.g. ``device.identifier``, ``qos.session.id``).
+    """
 
     text: str
     goal: str
@@ -34,6 +42,9 @@ class Intent(BaseModel):
     entities: list[IntentEntity] = Field(default_factory=list)
     constraints: list[str] = Field(default_factory=list)
     target_domains: list[str] = Field(default_factory=list)
+    required_capabilities: list[str] = Field(default_factory=list)
+    known_facts: list[str] = Field(default_factory=list)
+    missing_information: list[str] = Field(default_factory=list)
     confidence: float | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -46,3 +57,15 @@ class Intent(BaseModel):
         """Return a ``{name: value}`` mapping of all extracted entities."""
 
         return {e.name: e.value for e in self.entities}
+
+    def to_understanding(self) -> dict[str, Any]:
+        """Return the structured-intent view produced by the milestone-7 agent."""
+
+        return {
+            "goal": self.goal,
+            "entities": self.entity_values(),
+            "constraints": self.constraints,
+            "required_capabilities": self.required_capabilities,
+            "known_facts": self.known_facts,
+            "missing_information": self.missing_information,
+        }

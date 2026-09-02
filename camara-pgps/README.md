@@ -21,7 +21,7 @@ plan is validated and executed against a CAMARA gateway (or the bundled mock).
 | 4 | CAMARA OpenAPI Parser | ✅ done |
 | 5 | CAMARA Knowledge Ingestion Pipeline | ✅ done |
 | 6 | RAG Retrieval | ✅ done |
-| 7 | Intent Understanding | ⬜ planned |
+| 7 | Intent Understanding | ✅ done |
 | 8 | API Selection | ⬜ planned |
 | 9 | Parameter Extraction | ⬜ planned |
 | 10 | PGPS Dependency Model | ⬜ planned |
@@ -87,7 +87,8 @@ camara-pgps/
 │   ├── cli.py           console-script entry point
 │   ├── models/          shared domain models (intent, api, plan, state, …)
 │   ├── camara/          API registry, capability mapper & OpenAPI parser
-│   └── retrieval/       ingestion, embeddings, ChromaDB retriever, RAG retrieval
+│   ├── retrieval/       ingestion, embeddings, ChromaDB retriever, RAG retrieval
+│   └── agents/          LLM agents (intent understanding, …)
 ├── configs/             YAML configuration defaults
 ├── data/                local artefacts (vector store, knowledge graph) - gitignored
 │   └── registry/        camara_apis.json - the local API registry (tracked)

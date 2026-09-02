@@ -38,6 +38,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# LLM provider integrations for the agents. Optional: without them the agents
+# fall back to deterministic rule-based parsing.
+llm = [
+    "langchain-anthropic>=0.3",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -70,3 +75,9 @@ testpaths = ["tests"]
 python_version = "3.11"
 plugins = ["pydantic.mypy"]
 strict = true
+
+[[tool.mypy.overrides]]
+# Optional LLM provider packages (the "llm" extra); imported lazily with a
+# graceful ImportError fallback.
+module = ["langchain_anthropic.*", "langchain_openai.*"]
+ignore_missing_imports = true
