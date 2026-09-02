@@ -77,6 +77,10 @@ class RegistryOperation(CamaraOperation):
     errors: list[ResponseSpec] = Field(default_factory=list)
     examples: dict[str, Any] = Field(default_factory=dict)
     source: SourceRef | None = None
+class RegistryOperation(CamaraOperation):
+    """A registry operation entry: a :class:`CamaraOperation` plus its capability."""
+
+    capability: str | None = None
 
 
 class RegistryAPI(CamaraAPI):

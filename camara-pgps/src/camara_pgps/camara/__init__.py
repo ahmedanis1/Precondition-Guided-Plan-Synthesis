@@ -52,6 +52,9 @@ __all__ = [
     "RegistryOperation",
     "ResponseSpec",
     "SourceRef",
+    "RegistryDocument",
+    "RegistryAPI",
+    "RegistryOperation",
     "Provenance",
     "SourceType",
 ]
