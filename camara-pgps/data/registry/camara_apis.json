@@ -1,0 +1,438 @@
+{
+  "version": "0.1.0",
+  "description": "Hand-authored minimal CAMARA API registry for milestone 3. Superseded by the OpenAPI parser in milestone 4.",
+  "generated_at": "2026-09-02T00:00:00Z",
+  "apis": [
+    {
+      "name": "device-location",
+      "title": "Device Location",
+      "version": "0.3.0",
+      "description": "Check whether a device is within a requested area and retrieve its last known location.",
+      "base_path": "/device-location/v0",
+      "tags": ["location"],
+      "provenance": {
+        "source_type": "local_registry",
+        "location": "data/registry/camara_apis.json",
+        "spec_version": "0.3.0",
+        "note": "Hand-authored subset for milestone 3; replaced by parsed CAMARA OpenAPI in milestone 4."
+      },
+      "operations": [
+        {
+          "operation_id": "verifyLocation",
+          "method": "POST",
+          "path": "/verify",
+          "summary": "Verify whether a device is within a given area.",
+          "capability": "device-location.verify",
+          "api_name": "device-location",
+          "tags": ["location"],
+          "security_scopes": ["device-location:verify"],
+          "parameters": [
+            {
+              "name": "device",
+              "location": "body",
+              "required": true,
+              "description": "Identifier of the device to locate (phone number, network access id, or IP).",
+              "schema": {"type": "object"}
+            },
+            {
+              "name": "area",
+              "location": "body",
+              "required": true,
+              "description": "The area to check the device against (e.g. a circle with centre and radius).",
+              "schema": {"type": "object"}
+            },
+            {
+              "name": "maxAge",
+              "location": "body",
+              "required": false,
+              "description": "Maximum age of the location information in seconds.",
+              "schema": {"type": "integer", "minimum": 60}
+            }
+          ],
+          "preconditions": [
+            {
+              "kind": "precondition",
+              "description": "A valid OAuth2 access token is available.",
+              "requires": ["auth.token"],
+              "source": "manual"
+            },
+            {
+              "kind": "precondition",
+              "description": "The target device identifier is known.",
+              "requires": ["device.identifier"],
+              "source": "manual"
+            },
+            {
+              "kind": "precondition",
+              "description": "The area to verify against is known.",
+              "requires": ["location.area"],
+              "source": "manual"
+            }
+          ],
+          "postconditions": [
+            {
+              "kind": "postcondition",
+              "description": "Whether the device is within the requested area is known.",
+              "produces": ["device.location.verification"],
+              "source": "manual"
+            }
+          ]
+        },
+        {
+          "operation_id": "retrieveLocation",
+          "method": "POST",
+          "path": "/retrieve",
+          "summary": "Retrieve the last known location of a device.",
+          "capability": "device-location.retrieve",
+          "api_name": "device-location",
+          "tags": ["location"],
+          "security_scopes": ["device-location:retrieve"],
+          "parameters": [
+            {
+              "name": "device",
+              "location": "body",
+              "required": true,
+              "description": "Identifier of the device to locate.",
+              "schema": {"type": "object"}
+            },
+            {
+              "name": "maxAge",
+              "location": "body",
+              "required": false,
+              "description": "Maximum age of the location information in seconds.",
+              "schema": {"type": "integer", "minimum": 60}
+            }
+          ],
+          "preconditions": [
+            {
+              "kind": "precondition",
+              "description": "A valid OAuth2 access token is available.",
+              "requires": ["auth.token"],
+              "source": "manual"
+            },
+            {
+              "kind": "precondition",
+              "description": "The target device identifier is known.",
+              "requires": ["device.identifier"],
+              "source": "manual"
+            }
+          ],
+          "postconditions": [
+            {
+              "kind": "postcondition",
+              "description": "The device's last known location (area and civic address) is known.",
+              "produces": ["device.location", "device.location.area"],
+              "source": "manual"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "quality-on-demand",
+      "title": "Quality on Demand",
+      "version": "0.11.0",
+      "description": "Create and manage on-demand QoS sessions that apply a chosen quality profile between a device and an application server.",
+      "base_path": "/quality-on-demand/v0",
+      "tags": ["qos"],
+      "provenance": {
+        "source_type": "local_registry",
+        "location": "data/registry/camara_apis.json",
+        "spec_version": "0.11.0",
+        "note": "Hand-authored subset for milestone 3; replaced by parsed CAMARA OpenAPI in milestone 4."
+      },
+      "operations": [
+        {
+          "operation_id": "createSession",
+          "method": "POST",
+          "path": "/sessions",
+          "summary": "Create a QoS session with a requested QoS profile.",
+          "capability": "qos.session.create",
+          "api_name": "quality-on-demand",
+          "tags": ["qos"],
+          "security_scopes": ["quality-on-demand:sessions:create"],
+          "parameters": [
+            {
+              "name": "device",
+              "location": "body",
+              "required": true,
+              "description": "Identifier of the device the session applies to.",
+              "schema": {"type": "object"}
+            },
+            {
+              "name": "applicationServer",
+              "location": "body",
+              "required": true,
+              "description": "IPv4/IPv6 address of the application server.",
+              "schema": {"type": "object"}
+            },
+            {
+              "name": "qosProfile",
+              "location": "body",
+              "required": true,
+              "description": "Name of the QoS profile to apply.",
+              "schema": {"type": "string"}
+            },
+            {
+              "name": "duration",
+              "location": "body",
+              "required": true,
+              "description": "Requested session duration in seconds.",
+              "schema": {"type": "integer", "minimum": 1}
+            },
+            {
+              "name": "devicePorts",
+              "location": "body",
+              "required": false,
+              "description": "Ports on the device the session applies to.",
+              "schema": {"type": "object"}
+            },
+            {
+              "name": "applicationServerPorts",
+              "location": "body",
+              "required": false,
+              "description": "Ports on the application server the session applies to.",
+              "schema": {"type": "object"}
+            },
+            {
+              "name": "webhook",
+              "location": "body",
+              "required": false,
+              "description": "Sink and auth details for session event notifications.",
+              "schema": {"type": "object"}
+            }
+          ],
+          "preconditions": [
+            {
+              "kind": "precondition",
+              "description": "A valid OAuth2 access token is available.",
+              "requires": ["auth.token"],
+              "source": "manual"
+            },
+            {
+              "kind": "precondition",
+              "description": "The target device identifier is known.",
+              "requires": ["device.identifier"],
+              "source": "manual"
+            },
+            {
+              "kind": "precondition",
+              "description": "A QoS profile name has been chosen.",
+              "requires": ["qos.profile"],
+              "source": "manual"
+            }
+          ],
+          "postconditions": [
+            {
+              "kind": "postcondition",
+              "description": "A QoS session exists and its identifier is known.",
+              "produces": ["qos.session.id", "qos.session"],
+              "source": "manual"
+            }
+          ]
+        },
+        {
+          "operation_id": "getSession",
+          "method": "GET",
+          "path": "/sessions/{sessionId}",
+          "summary": "Retrieve the QoS session bound to an identifier.",
+          "capability": "qos.session.retrieve",
+          "api_name": "quality-on-demand",
+          "tags": ["qos"],
+          "security_scopes": ["quality-on-demand:sessions:read"],
+          "parameters": [
+            {
+              "name": "sessionId",
+              "location": "path",
+              "required": true,
+              "description": "Identifier of the QoS session.",
+              "schema": {"type": "string", "format": "uuid"}
+            }
+          ],
+          "preconditions": [
+            {
+              "kind": "precondition",
+              "description": "A valid OAuth2 access token is available.",
+              "requires": ["auth.token"],
+              "source": "manual"
+            },
+            {
+              "kind": "precondition",
+              "description": "The QoS session identifier is known.",
+              "requires": ["qos.session.id"],
+              "source": "manual"
+            }
+          ],
+          "postconditions": [
+            {
+              "kind": "postcondition",
+              "description": "The current state of the QoS session is known.",
+              "produces": ["qos.session"],
+              "source": "manual"
+            }
+          ]
+        },
+        {
+          "operation_id": "deleteSession",
+          "method": "DELETE",
+          "path": "/sessions/{sessionId}",
+          "summary": "Delete a QoS session and release its resources.",
+          "capability": "qos.session.delete",
+          "api_name": "quality-on-demand",
+          "tags": ["qos"],
+          "security_scopes": ["quality-on-demand:sessions:delete"],
+          "parameters": [
+            {
+              "name": "sessionId",
+              "location": "path",
+              "required": true,
+              "description": "Identifier of the QoS session to delete.",
+              "schema": {"type": "string", "format": "uuid"}
+            }
+          ],
+          "preconditions": [
+            {
+              "kind": "precondition",
+              "description": "A valid OAuth2 access token is available.",
+              "requires": ["auth.token"],
+              "source": "manual"
+            },
+            {
+              "kind": "precondition",
+              "description": "The QoS session identifier is known.",
+              "requires": ["qos.session.id"],
+              "source": "manual"
+            }
+          ],
+          "postconditions": [
+            {
+              "kind": "postcondition",
+              "description": "The QoS session no longer exists.",
+              "produces": [],
+              "source": "manual"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "network-insights",
+      "title": "Network Insights",
+      "version": "0.1.0",
+      "description": "Subscribe to and retrieve network-condition insights for a device (stub subset).",
+      "base_path": "/network-insights/v0",
+      "tags": ["insights"],
+      "provenance": {
+        "source_type": "local_registry",
+        "location": "data/registry/camara_apis.json",
+        "spec_version": "0.1.0",
+        "note": "Hand-authored stub for milestone 3; only two operations are modelled."
+      },
+      "operations": [
+        {
+          "operation_id": "createInsightsSubscription",
+          "method": "POST",
+          "path": "/subscriptions",
+          "summary": "Create a subscription for network-insight notifications about a device.",
+          "capability": "network-insights.subscription.create",
+          "api_name": "network-insights",
+          "tags": ["insights"],
+          "security_scopes": ["network-insights:subscriptions:create"],
+          "parameters": [
+            {
+              "name": "device",
+              "location": "body",
+              "required": true,
+              "description": "Identifier of the device the insights are about.",
+              "schema": {"type": "object"}
+            },
+            {
+              "name": "types",
+              "location": "body",
+              "required": true,
+              "description": "The insight event types to subscribe to.",
+              "schema": {"type": "array", "items": {"type": "string"}}
+            },
+            {
+              "name": "sink",
+              "location": "body",
+              "required": true,
+              "description": "Callback URL that notifications are delivered to.",
+              "schema": {"type": "string", "format": "uri"}
+            },
+            {
+              "name": "subscriptionExpireTime",
+              "location": "body",
+              "required": false,
+              "description": "When the subscription should expire.",
+              "schema": {"type": "string", "format": "date-time"}
+            }
+          ],
+          "preconditions": [
+            {
+              "kind": "precondition",
+              "description": "A valid OAuth2 access token is available.",
+              "requires": ["auth.token"],
+              "source": "manual"
+            },
+            {
+              "kind": "precondition",
+              "description": "The target device identifier is known.",
+              "requires": ["device.identifier"],
+              "source": "manual"
+            }
+          ],
+          "postconditions": [
+            {
+              "kind": "postcondition",
+              "description": "A network-insights subscription exists and its identifier is known.",
+              "produces": ["network-insights.subscription.id"],
+              "source": "manual"
+            }
+          ]
+        },
+        {
+          "operation_id": "getInsightsSubscription",
+          "method": "GET",
+          "path": "/subscriptions/{subscriptionId}",
+          "summary": "Retrieve a network-insights subscription by identifier.",
+          "capability": "network-insights.subscription.retrieve",
+          "api_name": "network-insights",
+          "tags": ["insights"],
+          "security_scopes": ["network-insights:subscriptions:read"],
+          "parameters": [
+            {
+              "name": "subscriptionId",
+              "location": "path",
+              "required": true,
+              "description": "Identifier of the subscription.",
+              "schema": {"type": "string", "format": "uuid"}
+            }
+          ],
+          "preconditions": [
+            {
+              "kind": "precondition",
+              "description": "A valid OAuth2 access token is available.",
+              "requires": ["auth.token"],
+              "source": "manual"
+            },
+            {
+              "kind": "precondition",
+              "description": "The subscription identifier is known.",
+              "requires": ["network-insights.subscription.id"],
+              "source": "manual"
+            }
+          ],
+          "postconditions": [
+            {
+              "kind": "postcondition",
+              "description": "The current state of the subscription is known.",
+              "produces": ["network-insights.subscription"],
+              "source": "manual"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

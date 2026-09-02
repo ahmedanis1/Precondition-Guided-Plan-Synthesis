@@ -24,6 +24,9 @@ vector_store:
 graph:
   path: data/knowledge_graph.gml
 
+registry:
+  path: data/registry/camara_apis.json
+
 camara:
   base_url: http://localhost:8080
 
