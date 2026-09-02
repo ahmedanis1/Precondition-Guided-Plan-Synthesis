@@ -310,7 +310,7 @@
             {
               "kind": "postcondition",
               "description": "The QoS session no longer exists.",
-              "produces": [],
+              "produces": ["qos.session.deleted"],
               "source": "manual"
             }
           ]
