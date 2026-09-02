@@ -16,7 +16,7 @@ plan is validated and executed against a CAMARA gateway (or the bundled mock).
 | # | Milestone | State |
 |---|-----------|-------|
 | 1 | Project Foundation | ✅ done |
-| 2 | Domain Models | ⬜ planned |
+| 2 | Domain Models | ✅ done |
 | 3 | CAMARA API Registry | ⬜ planned |
 | 4 | CAMARA OpenAPI Parser | ⬜ planned |
 | 5 | CAMARA Knowledge Ingestion Pipeline | ⬜ planned |
@@ -84,7 +84,8 @@ camara-pgps/
 ├── src/camara_pgps/     application package
 │   ├── __about__.py     version
 │   ├── config.py        pydantic-settings configuration
-│   └── cli.py           console-script entry point
+│   ├── cli.py           console-script entry point
+│   └── models/          shared domain models (intent, api, plan, state, …)
 ├── configs/             YAML configuration defaults
 ├── data/                local artefacts (vector store, knowledge graph) - gitignored
 ├── scripts/             environment / maintenance helpers
