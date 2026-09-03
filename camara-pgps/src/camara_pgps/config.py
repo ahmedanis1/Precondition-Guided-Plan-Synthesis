@@ -76,6 +76,15 @@ class CamaraSettings(BaseModel):
 
     base_url: str = "http://localhost:8080"
     token: str | None = None
+    timeout_seconds: float = 30.0
+
+
+class ExecutionSettings(BaseModel):
+    """How validated plans are executed against the CAMARA API."""
+
+    mode: str = "mock"  # mock | rest | mcp
+    stop_on_error: bool = True
+    dry_run: bool = False
 
 
 class MockCamaraSettings(BaseModel):
@@ -122,6 +131,7 @@ class Settings(BaseSettings):
     graph: GraphSettings = Field(default_factory=GraphSettings)
     registry: RegistrySettings = Field(default_factory=RegistrySettings)
     camara: CamaraSettings = Field(default_factory=CamaraSettings)
+    execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
     mock_camara: MockCamaraSettings = Field(default_factory=MockCamaraSettings)
     server: ServerSettings = Field(default_factory=ServerSettings)
     mcp: MCPSettings = Field(default_factory=MCPSettings)

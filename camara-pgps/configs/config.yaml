@@ -32,6 +32,12 @@ registry:
 
 camara:
   base_url: http://localhost:8080
+  timeout_seconds: 30.0
+
+execution:
+  mode: mock          # mock | rest | mcp
+  stop_on_error: true
+  dry_run: false
 
 mock_camara:
   host: 0.0.0.0
