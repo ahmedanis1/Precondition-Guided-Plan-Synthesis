@@ -5,6 +5,8 @@
   candidate APIs / operations.
 * :mod:`camara_pgps.agents.parameter_agent` - request + candidate operations ->
   grounded parameter bindings (+ missing_information).
+* :mod:`camara_pgps.agents.repair_agent` - missing_information -> one
+  natural-language clarification question (never fills in values).
 """
 
 from camara_pgps.agents.api_selection_agent import (
@@ -34,6 +36,14 @@ from camara_pgps.agents.parameter_agent import (
     RuleBasedParameterExtractor,
     get_parameter_agent,
 )
+from camara_pgps.agents.repair_agent import (
+    ClarificationRequest,
+    LLMPhraser,
+    MissingItem,
+    RepairAgent,
+    RuleBasedPhraser,
+    get_repair_agent,
+)
 
 __all__ = [
     "IntentAgent",
@@ -57,4 +67,10 @@ __all__ = [
     "SelectionSource",
     "LLMApiSelector",
     "get_api_selection_agent",
+    "RepairAgent",
+    "ClarificationRequest",
+    "MissingItem",
+    "RuleBasedPhraser",
+    "LLMPhraser",
+    "get_repair_agent",
 ]

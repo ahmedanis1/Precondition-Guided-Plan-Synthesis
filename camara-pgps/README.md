@@ -30,8 +30,9 @@ plan is validated and executed against a CAMARA gateway (or the bundled mock).
 | 13 | Execution Layer | ✅ done |
 | 14 | Mock CAMARA Services | ✅ done |
 | 15 | LangGraph Orchestration | ✅ done |
-| 16 | FastAPI + CLI | ⬜ planned |
-| 17 | End-to-End Integration | ⬜ planned |
+| 16 | Clarification / Repair Agent | ✅ done |
+| 17 | FastAPI + CLI | ⬜ planned |
+| 18 | End-to-End Integration | ⬜ planned |
 
 ## Requirements
 
@@ -96,7 +97,7 @@ camara-pgps/
 │   ├── models/          shared domain models (intent, api, plan, state, …)
 │   ├── camara/          API registry, capability mapper & OpenAPI parser
 │   ├── retrieval/       ingestion, embeddings, ChromaDB retriever, RAG retrieval
-│   ├── agents/          LLM agents (intent, API selection, parameter extraction)
+│   ├── agents/          LLM agents (intent, API selection, parameter extraction, repair)
 │   ├── pgps/            condition model, dependency graph, deterministic solver & planner
 │   ├── validator/       plan validation - structural (PGPS) + API/payload layers
 │   ├── execution/       APIExecutor + mock / REST / MCP backends
