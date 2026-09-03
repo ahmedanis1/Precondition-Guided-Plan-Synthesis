@@ -33,7 +33,8 @@ plan is validated and executed against a CAMARA gateway (or the bundled mock).
 | 16 | Clarification / Repair Agent | ✅ done |
 | 17 | FastAPI | ✅ done |
 | 18 | CLI | ✅ done |
-| 19 | End-to-End Integration | ⬜ planned |
+| 19 | Explainability & Provenance | ✅ done |
+| 20 | End-to-End Integration | ⬜ planned |
 
 ## Requirements
 
@@ -106,7 +107,7 @@ camara-pgps/
 │   ├── camara/          API registry, capability mapper & OpenAPI parser
 │   ├── retrieval/       ingestion, embeddings, ChromaDB retriever, RAG retrieval
 │   ├── agents/          LLM agents (intent, API selection, parameter extraction, repair)
-│   ├── pgps/            condition model, dependency graph, deterministic solver & planner
+│   ├── pgps/            condition model, dependency graph, deterministic solver, planner & explainer
 │   ├── validator/       plan validation - structural (PGPS) + API/payload layers
 │   ├── execution/       APIExecutor + mock / REST / MCP backends
 │   ├── workflow/        LangGraph pipeline wiring every component into AgentState
@@ -114,8 +115,9 @@ camara-pgps/
 ├── configs/             YAML configuration defaults
 ├── data/                local artefacts (vector store, knowledge graph) - gitignored
 │   └── registry/        camara_apis.json - the local API registry (tracked)
-├── scripts/             environment / maintenance helpers
+├── scripts/             run_agent.py, ingest_camara.py, environment helpers
 ├── mock_camara/         runnable mock CAMARA gateway (main.py + services/)
+├── docs/                architecture.md, adding-a-camara-api.md
 ├── tests/               test suite
 ├── .env.example         environment-variable template
 ├── environment.yml      conda environment definition
@@ -123,10 +125,20 @@ camara-pgps/
 └── docker-compose.yml   optional dev stack (mock gateway + API)
 ```
 
+## Documentation
+
+- [`docs/architecture.md`](docs/architecture.md) — layers, the PGPS core, safety boundaries, the offline/test posture
+- [`docs/adding-a-camara-api.md`](docs/adding-a-camara-api.md) — how to register a new CAMARA API and its conditions
+
+Every run carries a **graph-derived explanation** (`provenance` in the API/CLI
+output): Goal → Selected APIs → Required facts → Produced facts → Dependencies →
+Execution order, built from the PGPS dependency graph (`source =
+"pgps-dependency-graph"`), never an LLM.
+
 ## Tech stack
 
 Pydantic · LangChain · LangGraph · FastAPI · httpx · PyYAML · ChromaDB ·
-sentence-transformers · NetworkX · Model Context Protocol
+sentence-transformers · NetworkX · jsonschema · Model Context Protocol
 
 ## License
 
