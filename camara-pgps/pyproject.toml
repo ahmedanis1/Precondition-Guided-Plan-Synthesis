@@ -55,12 +55,13 @@ dev = [
 
 [project.scripts]
 camara-pgps = "camara_pgps.cli:main"
+mock-camara = "mock_camara.main:main"
 
 [project.urls]
 Homepage = "https://github.com/ahmedanis1/camara-pgps"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/camara_pgps"]
+packages = ["src/camara_pgps", "mock_camara"]
 
 [tool.ruff]
 line-length = 100
