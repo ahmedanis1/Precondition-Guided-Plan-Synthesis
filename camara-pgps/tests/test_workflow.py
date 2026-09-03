@@ -121,7 +121,8 @@ def test_missing_information_branches_to_clarification(workflow: CamaraWorkflow)
     assert state.clarification
     last = state.messages[-1]
     assert last["role"] == "assistant"
-    assert "more information" in last["content"].lower()
+    assert "still need you to provide" in last["content"].lower()
+    assert state.metadata["clarification"]["missing"]
 
 
 def test_unrelated_request_does_not_execute(workflow: CamaraWorkflow) -> None:

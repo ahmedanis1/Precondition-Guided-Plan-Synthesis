@@ -12,6 +12,7 @@ from typing import Any
 from camara_pgps.agents.api_selection_agent import APISelectionAgent
 from camara_pgps.agents.intent_agent import IntentAgent
 from camara_pgps.agents.parameter_agent import ParameterExtractionAgent
+from camara_pgps.agents.repair_agent import RepairAgent
 from camara_pgps.camara.registry import CamaraRegistry
 from camara_pgps.config import Settings, get_settings
 from camara_pgps.execution import APIExecutor, build_executor
@@ -68,6 +69,7 @@ class WorkflowNodes:
         planner: PGPSPlanner | None = None,
         validator: PlanValidator | None = None,
         executor: APIExecutor | None = None,
+        repair_agent: RepairAgent | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.registry = registry or CamaraRegistry.from_settings(self.settings)
@@ -85,6 +87,7 @@ class WorkflowNodes:
         self.validator = validator or PlanValidator(
             registry=self.registry, settings=self.settings
         )
+        self.repair_agent = repair_agent or RepairAgent.from_settings(self.settings)
         self._executor = executor
 
     # -- lazily built (touch external state) -------------------------------
@@ -125,6 +128,31 @@ class WorkflowNodes:
     @staticmethod
     def _family(capability: str | None) -> str:
         return (capability or "").split(".", 1)[0]
+
+    def _fallback_missing(self, state: AgentState) -> list[str]:
+        """Missing params when there is no plan: scope to the relevant operation(s)."""
+
+        extraction = state.parameters
+        if extraction is None:
+            return []
+        families = (
+            set(state.intent.required_capabilities) if state.intent is not None else set()
+        )
+        targets: set[str] = set()
+        if families:
+            targets = {
+                op.operation_id
+                for op in state.selected_operations
+                if self._family(self.registry.capability_of(op.operation_id)) in families
+            }
+        if not targets and state.selection is not None and state.selection.operations:
+            targets = {state.selection.operations[0].operation_id}
+
+        missing: list[str] = []
+        for op_params in extraction.operations:
+            if not targets or op_params.operation_id in targets:
+                missing.extend(op_params.missing_required)
+        return missing
 
     # -- nodes -----------------------------------------------------------------
 
@@ -282,33 +310,44 @@ class WorkflowNodes:
         }
 
     def clarification_node(self, state: AgentState) -> _Update:
-        reasons = list(state.clarification)
-        if not state.selected_operations:
-            reasons.append("No registered CAMARA operation matched the request.")
-
-        plan_gaps = plan_missing_parameters(state)
-        if not plan_gaps and state.parameters is not None and (
+        # what values are still needed
+        missing = plan_missing_parameters(state)
+        if not missing and state.parameters is not None and (
             state.plan is None or not state.plan.steps
         ):
-            # no executable plan yet - fall back to the overall missing parameters
-            plan_gaps = list(state.parameters.missing_information)
-        reasons += [f"provide a value for {name!r}" for name in plan_gaps]
-
+            missing = self._fallback_missing(state)
         if state.plan is not None:
-            reasons += [
-                f"unmet precondition: {fact}" for fact in state.plan.unmet_preconditions
-            ]
-            reasons += state.plan.validation_errors
-        reasons += state.errors
-        reasons = _dedupe(reasons)
-        body = (
-            "I need more information before I can proceed:\n- " + "\n- ".join(reasons)
-            if reasons
-            else "I could not build an executable plan for this request."
+            missing += list(state.plan.unmet_preconditions)
+        missing = _dedupe(missing)
+
+        operations = (
+            [step.operation_id for step in state.plan.steps]
+            if state.plan is not None and state.plan.steps
+            else [op.operation_id for op in state.selected_operations]
         )
+        request = self.repair_agent.clarify(
+            missing,
+            intent=state.intent,
+            plan=state.plan,
+            operations=operations,
+            request_text=state.request_text,
+        )
+
+        extra: list[str] = []
+        if not state.selected_operations:
+            extra.append("No registered CAMARA operation matched the request.")
+        if state.plan is not None:
+            extra += state.plan.validation_errors
+        extra += state.errors
+
+        body = request.question
+        if extra:
+            body += "\n(" + "; ".join(_dedupe(extra)) + ")"
+
         return {
-            "clarification": reasons,
+            "clarification": request.missing_names(),
             "stage": PipelineStage.CLARIFICATION,
+            "metadata": {**state.metadata, "clarification": request.model_dump()},
             "messages": [{"role": "assistant", "content": body}],
         }
 
