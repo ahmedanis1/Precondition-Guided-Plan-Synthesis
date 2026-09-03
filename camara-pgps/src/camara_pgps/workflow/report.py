@@ -65,6 +65,7 @@ def state_report(state: AgentState) -> dict[str, Any]:
         "validation": state.metadata.get("validation_report"),
         "execution": _dump(state.execution),
         "clarification": state.clarification,
+        "provenance": state.metadata.get("provenance"),
         "explanation": explain(state),
         "messages": state.messages,
         "errors": state.errors,

@@ -18,6 +18,7 @@ from camara_pgps.config import Settings, get_settings
 from camara_pgps.execution import APIExecutor, build_executor
 from camara_pgps.models.plan import PlanRequest, PlanStatus
 from camara_pgps.models.state import AgentState, PipelineStage
+from camara_pgps.pgps.explain import explain_plan
 from camara_pgps.pgps.planner import PGPSPlanner
 from camara_pgps.retrieval.rag import RagRetriever
 from camara_pgps.validator.validator import PlanValidator
@@ -323,7 +324,8 @@ class WorkflowNodes:
             result = self.planner.plan(state.plan_request)
         except Exception as exc:  # noqa: BLE001
             return self._fail("pgps", exc)
-        return {
+
+        update: _Update = {
             "plan": result,
             "stage": PipelineStage.PLANNING,
             "messages": [
@@ -336,6 +338,18 @@ class WorkflowNodes:
                 }
             ],
         }
+        if result.steps:
+            explanation = explain_plan(
+                result,
+                registry=self.registry,
+                intent=state.intent,
+                initial_facts=set(state.facts),
+            )
+            update["metadata"] = {
+                **state.metadata,
+                "provenance": explanation.model_dump(mode="json"),
+            }
+        return update
 
     def clarification_node(self, state: AgentState) -> _Update:
         # what values are still needed

@@ -94,7 +94,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return 0 if state.stage.value != "failed" else 1
 
     print(explain(state))
-    if state.plan is not None and state.plan.steps:
+    provenance = state.metadata.get("provenance")
+    if provenance and provenance.get("narrative"):
+        print("\n" + provenance["narrative"])
+    elif state.plan is not None and state.plan.steps:
         print("\nPlan:")
         for step in state.plan.steps:
             print(f"  {step.index + 1}. {step.operation_id}  {step.method} {step.path}")

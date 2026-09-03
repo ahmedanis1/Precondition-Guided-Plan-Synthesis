@@ -14,6 +14,15 @@ from camara_pgps.pgps.dependency_graph import (
     DependencyGraph,
     UnsatisfiedPreconditionError,
 )
+from camara_pgps.pgps.explain import (
+    EXPLANATION_SOURCE,
+    DependencyExplanation,
+    FactProvenance,
+    PlanExplanation,
+    StepExplanation,
+    explain_plan,
+    render_narrative,
+)
 from camara_pgps.pgps.planner import PGPSPlanner, get_planner
 from camara_pgps.pgps.solver import (
     PGPSSolver,
@@ -39,4 +48,11 @@ __all__ = [
     "SolverStatus",
     "PGPSPlanner",
     "get_planner",
+    "explain_plan",
+    "render_narrative",
+    "PlanExplanation",
+    "FactProvenance",
+    "DependencyExplanation",
+    "StepExplanation",
+    "EXPLANATION_SOURCE",
 ]
