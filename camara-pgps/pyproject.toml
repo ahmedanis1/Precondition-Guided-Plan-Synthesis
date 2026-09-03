@@ -86,6 +86,6 @@ module = ["langchain_anthropic.*", "langchain_openai.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-# networkx / jsonschema ship no (bundled) type stubs.
-module = ["networkx.*", "jsonschema.*"]
+# networkx / jsonschema / langgraph ship no (bundled) type stubs mypy can use.
+module = ["networkx.*", "jsonschema.*", "langgraph.*"]
 ignore_missing_imports = true
