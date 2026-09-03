@@ -1,23 +1,26 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ClaudeCodeEditorTabs">
-    <option name="activeSessionId" value="4e35451f-a929-4238-8f36-9e8292d2e7da" />
+    <option name="activeSessionId" value="86cae857-14ba-47ed-b5af-c8476b77f42d" />
     <option name="openSessionIds">
       <list>
         <option value="5cae4c47-53e7-42f8-944d-13c659916cda" />
         <option value="4e35451f-a929-4238-8f36-9e8292d2e7da" />
+        <option value="86cae857-14ba-47ed-b5af-c8476b77f42d" />
       </list>
     </option>
     <option name="sessionPaths">
       <map>
         <entry key="4e35451f-a929-4238-8f36-9e8292d2e7da" value="/sessions/29d0dc91-eb04-45fe-8c6b-f5f5f63c774a" />
         <entry key="5cae4c47-53e7-42f8-944d-13c659916cda" value="/sessions/932a609e-4e98-4a4e-b942-3775b4610a00" />
+        <entry key="86cae857-14ba-47ed-b5af-c8476b77f42d" value="/sessions/932a609e-4e98-4a4e-b942-3775b4610a00" />
       </map>
     </option>
     <option name="sessionTitles">
       <map>
         <entry key="4e35451f-a929-4238-8f36-9e8292d2e7da" value="i am wirting my thesis which is Precondition-Guide" />
         <entry key="5cae4c47-53e7-42f8-944d-13c659916cda" value="Task 1 — Project Foundation Goal: Create the basic" />
+        <entry key="86cae857-14ba-47ed-b5af-c8476b77f42d" value="Task 1 — Project Foundation Goal: Create the basic" />
       </map>
     </option>
   </component>
