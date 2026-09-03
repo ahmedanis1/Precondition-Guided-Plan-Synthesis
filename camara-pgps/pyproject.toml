@@ -55,6 +55,7 @@ dev = [
 
 [project.scripts]
 camara-pgps = "camara_pgps.cli:main"
+camara-pgps-api = "camara_pgps.api.main:main"
 mock-camara = "mock_camara.main:main"
 
 [project.urls]
@@ -69,6 +70,10 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency-injection markers are the documented way to use them
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Path", "fastapi.Body"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
