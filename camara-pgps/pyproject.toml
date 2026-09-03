@@ -32,6 +32,8 @@ dependencies = [
     "sentence-transformers>=3.0",
     # Knowledge graph
     "networkx>=3.3",
+    # Plan / payload validation
+    "jsonschema>=4.20",
     # Model Context Protocol
     "mcp>=1.0",
     "langchain-mcp-adapters>=0.1",
@@ -83,6 +85,6 @@ module = ["langchain_anthropic.*", "langchain_openai.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-# networkx ships no type stubs.
-module = ["networkx.*"]
+# networkx / jsonschema ship no (bundled) type stubs.
+module = ["networkx.*", "jsonschema.*"]
 ignore_missing_imports = true

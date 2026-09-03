@@ -26,7 +26,7 @@ plan is validated and executed against a CAMARA gateway (or the bundled mock).
 | 9 | Parameter Extraction | ✅ done |
 | 10 | PGPS Dependency Model | ✅ done |
 | 11 | PGPS Planner | ✅ done |
-| 12 | Plan Validator | ⬜ planned |
+| 12 | Plan Validator | ✅ done |
 | 13 | Execution Layer | ⬜ planned |
 | 14 | LangGraph Orchestration | ⬜ planned |
 | 15 | FastAPI + CLI | ⬜ planned |
@@ -89,7 +89,8 @@ camara-pgps/
 │   ├── camara/          API registry, capability mapper & OpenAPI parser
 │   ├── retrieval/       ingestion, embeddings, ChromaDB retriever, RAG retrieval
 │   ├── agents/          LLM agents (intent, API selection, parameter extraction)
-│   └── pgps/            condition model, dependency graph, deterministic solver & planner
+│   ├── pgps/            condition model, dependency graph, deterministic solver & planner
+│   └── validator/       plan validation - structural (PGPS) + API/payload layers
 ├── configs/             YAML configuration defaults
 ├── data/                local artefacts (vector store, knowledge graph) - gitignored
 │   └── registry/        camara_apis.json - the local API registry (tracked)
