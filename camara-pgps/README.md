@@ -31,7 +31,7 @@ plan is validated and executed against a CAMARA gateway (or the bundled mock).
 | 14 | Mock CAMARA Services | ✅ done |
 | 15 | LangGraph Orchestration | ✅ done |
 | 16 | Clarification / Repair Agent | ✅ done |
-| 17 | FastAPI + CLI | ⬜ planned |
+| 17 | FastAPI | ✅ done |
 | 18 | End-to-End Integration | ⬜ planned |
 
 ## Requirements
@@ -67,11 +67,15 @@ camara-pgps --show-config
 pytest
 ```
 
-Run the mock CAMARA gateway (the default execution target):
+Run the services:
 
 ```bash
-mock-camara                     # or: python -m uvicorn mock_camara.main:app --port 8080
-# docs at http://localhost:8080/docs
+mock-camara                     # mock CAMARA gateway  -> http://localhost:8080/docs
+camara-pgps-api                 # the CAMARA-PGPS API  -> http://localhost:8000/docs
+
+curl -s localhost:8000/api/v1/run \
+  -H 'content-type: application/json' \
+  -d '{"request": "Improve the network quality for my video call."}'
 ```
 
 ## Configuration
@@ -101,7 +105,8 @@ camara-pgps/
 │   ├── pgps/            condition model, dependency graph, deterministic solver & planner
 │   ├── validator/       plan validation - structural (PGPS) + API/payload layers
 │   ├── execution/       APIExecutor + mock / REST / MCP backends
-│   └── workflow/        LangGraph pipeline wiring every component into AgentState
+│   ├── workflow/        LangGraph pipeline wiring every component into AgentState
+│   └── api/             FastAPI app (/api/v1/run, /plan, /validate, /execute, /apis)
 ├── configs/             YAML configuration defaults
 ├── data/                local artefacts (vector store, knowledge graph) - gitignored
 │   └── registry/        camara_apis.json - the local API registry (tracked)

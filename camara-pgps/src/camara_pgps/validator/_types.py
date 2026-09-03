@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 class Severity(StrEnum):
@@ -90,14 +90,17 @@ class ValidationReport(BaseModel):
             i.severity is Severity.ERROR and i.layer is layer for i in self.issues
         )
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def structural_ok(self) -> bool:
         return not self._has_error(ValidationLayer.STRUCTURAL)
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def payload_ok(self) -> bool:
         return not self._has_error(ValidationLayer.PAYLOAD)
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def ok(self) -> bool:
         return self.structural_ok and self.payload_ok

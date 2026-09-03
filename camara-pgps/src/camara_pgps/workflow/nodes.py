@@ -365,6 +365,10 @@ class WorkflowNodes:
         return {
             "plan": updated,
             "stage": PipelineStage.VALIDATION,
+            "metadata": {
+                **state.metadata,
+                "validation_report": report.model_dump(mode="json"),
+            },
             "messages": [{"role": "system", "content": report.summary()}],
         }
 

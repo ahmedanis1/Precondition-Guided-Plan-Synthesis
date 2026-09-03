@@ -12,12 +12,55 @@ from functools import lru_cache
 from typing import Any
 
 from camara_pgps.config import Settings, get_settings
+from camara_pgps.models.plan import PlanResult
 from camara_pgps.models.state import AgentState
 from camara_pgps.workflow.nodes import (
     WorkflowNodes,
     route_after_pgps,
     route_after_validation,
 )
+
+_PLAN_NODES = (
+    "intent_node",
+    "rag_node",
+    "selection_node",
+    "parameters_node",
+    "build_plan_request_node",
+    "pgps_node",
+)
+
+# supplied-argument name -> fact key(s) it makes available (for direct plan/execute
+# calls that skip the parameter-extraction node)
+_ARG_FACTS: dict[str, tuple[str, ...]] = {
+    "device": ("device.identifier",),
+    "qosProfile": ("qos.profile",),
+    "sessionId": ("qos.session.id",),
+    "subscriptionId": ("network-insights.subscription.id",),
+    "area": ("location.area",),
+}
+
+
+def _facts_from_arguments(
+    arguments: dict[str, dict[str, Any]] | None,
+) -> dict[str, Any]:
+    facts: dict[str, Any] = {}
+    for op_arguments in (arguments or {}).values():
+        for name, value in op_arguments.items():
+            for fact_key in _ARG_FACTS.get(name, ()):
+                facts.setdefault(fact_key, value)
+    return facts
+
+
+def _merge_state(state: AgentState, update: dict[str, Any]) -> AgentState:
+    """Apply a node's partial update to the state (append-only fields accumulate)."""
+
+    new = state.model_copy()
+    for key, value in update.items():
+        if key in ("messages", "errors"):
+            setattr(new, key, [*getattr(new, key), *value])
+        else:
+            setattr(new, key, value)
+    return new
 
 
 class CamaraWorkflow:
@@ -100,6 +143,83 @@ class CamaraWorkflow:
         if isinstance(raw, AgentState):
             return raw
         return AgentState.model_validate(raw)
+
+    # -- partial runs (used by the HTTP API) --------------------------------
+
+    def _initial(
+        self,
+        request_text: str,
+        arguments: dict[str, dict[str, Any]] | None,
+        known_facts: dict[str, Any] | None,
+    ) -> AgentState:
+        return AgentState(
+            request_text=request_text,
+            supplied_arguments=dict(arguments or {}),
+            facts={
+                "auth.token": True,
+                **_facts_from_arguments(arguments),
+                **(known_facts or {}),
+            },
+        )
+
+    def _pipeline(self, state: AgentState, node_names: tuple[str, ...]) -> AgentState:
+        for name in node_names:
+            state = _merge_state(state, getattr(self.nodes, name)(state))
+        return state
+
+    def plan(
+        self,
+        request_text: str,
+        *,
+        arguments: dict[str, dict[str, Any]] | None = None,
+        known_facts: dict[str, Any] | None = None,
+    ) -> AgentState:
+        """Run intent -> RAG -> selection -> parameters -> PGPS (no validation/execution)."""
+
+        state = self._initial(request_text, arguments, known_facts)
+        return self._pipeline(state, _PLAN_NODES)
+
+    def validate(
+        self,
+        *,
+        request_text: str | None = None,
+        plan: PlanResult | None = None,
+        arguments: dict[str, dict[str, Any]] | None = None,
+        known_facts: dict[str, Any] | None = None,
+    ) -> AgentState:
+        """Validate a supplied plan, or plan a request and then validate it."""
+
+        if plan is not None:
+            state = self._initial(request_text or "", arguments, known_facts)
+            state.plan = plan
+            return self._pipeline(state, ("validation_node",))
+        state = self.plan(request_text or "", arguments=arguments, known_facts=known_facts)
+        step = "clarification_node" if route_after_pgps(state) == "clarify" else "validation_node"
+        return self._pipeline(state, (step,))
+
+    def execute(
+        self,
+        *,
+        request_text: str | None = None,
+        plan: PlanResult | None = None,
+        arguments: dict[str, dict[str, Any]] | None = None,
+        known_facts: dict[str, Any] | None = None,
+    ) -> AgentState:
+        """Execute a supplied validated plan, or run the full pipeline for a request."""
+
+        if plan is None:
+            return self.run(
+                request_text or "", arguments=arguments, known_facts=known_facts
+            )
+        state = self._initial(request_text or "", arguments, known_facts)
+        state.plan = plan
+        state = self._pipeline(state, ("validation_node",))
+        follow = (
+            "execution_node"
+            if route_after_validation(state) == "execute"
+            else "clarification_node"
+        )
+        return self._pipeline(state, (follow,))
 
     def mermaid(self) -> str:
         """Return the compiled graph as a Mermaid diagram."""
