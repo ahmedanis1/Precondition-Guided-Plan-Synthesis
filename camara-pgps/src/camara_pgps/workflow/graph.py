@@ -16,6 +16,7 @@ from camara_pgps.models.plan import PlanResult
 from camara_pgps.models.state import AgentState
 from camara_pgps.workflow.nodes import (
     WorkflowNodes,
+    facts_from_arguments,
     route_after_pgps,
     route_after_validation,
 )
@@ -28,27 +29,6 @@ _PLAN_NODES = (
     "build_plan_request_node",
     "pgps_node",
 )
-
-# supplied-argument name -> fact key(s) it makes available (for direct plan/execute
-# calls that skip the parameter-extraction node)
-_ARG_FACTS: dict[str, tuple[str, ...]] = {
-    "device": ("device.identifier",),
-    "qosProfile": ("qos.profile",),
-    "sessionId": ("qos.session.id",),
-    "subscriptionId": ("network-insights.subscription.id",),
-    "area": ("location.area",),
-}
-
-
-def _facts_from_arguments(
-    arguments: dict[str, dict[str, Any]] | None,
-) -> dict[str, Any]:
-    facts: dict[str, Any] = {}
-    for op_arguments in (arguments or {}).values():
-        for name, value in op_arguments.items():
-            for fact_key in _ARG_FACTS.get(name, ()):
-                facts.setdefault(fact_key, value)
-    return facts
 
 
 def _merge_state(state: AgentState, update: dict[str, Any]) -> AgentState:
@@ -157,7 +137,7 @@ class CamaraWorkflow:
             supplied_arguments=dict(arguments or {}),
             facts={
                 "auth.token": True,
-                **_facts_from_arguments(arguments),
+                **facts_from_arguments(arguments),
                 **(known_facts or {}),
             },
         )

@@ -36,6 +36,30 @@ def _dedupe(values: list[str]) -> list[str]:
     return out
 
 
+# supplied-argument name -> fact key(s) it makes available (for callers that
+# skip the parameter-extraction node, e.g. a hand-supplied plan)
+_ARG_FACTS: dict[str, tuple[str, ...]] = {
+    "device": ("device.identifier",),
+    "qosProfile": ("qos.profile",),
+    "sessionId": ("qos.session.id",),
+    "subscriptionId": ("network-insights.subscription.id",),
+    "area": ("location.area",),
+}
+
+
+def facts_from_arguments(
+    arguments: dict[str, dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Derive known fact keys from supplied ``{operation: {param: value}}`` arguments."""
+
+    facts: dict[str, Any] = {}
+    for operation_arguments in (arguments or {}).values():
+        for name, value in operation_arguments.items():
+            for fact_key in _ARG_FACTS.get(name, ()):
+                facts.setdefault(fact_key, value)
+    return facts
+
+
 def plan_missing_parameters(state: AgentState) -> list[str]:
     """Required parameters of the *plan's* operations that are still unbound."""
 
@@ -241,7 +265,11 @@ class WorkflowNodes:
 
         return {
             "parameters": extraction,
-            "facts": {**state.facts, **extraction.known_facts},
+            "facts": {
+                **state.facts,
+                **extraction.known_facts,
+                **facts_from_arguments(state.supplied_arguments),
+            },
             "stage": PipelineStage.PARAMETERS,
             "messages": [
                 {
@@ -436,6 +464,7 @@ def route_after_validation(state: AgentState) -> str:
 
 __all__ = [
     "WorkflowNodes",
+    "facts_from_arguments",
     "plan_missing_parameters",
     "route_after_pgps",
     "route_after_validation",

@@ -32,7 +32,8 @@ plan is validated and executed against a CAMARA gateway (or the bundled mock).
 | 15 | LangGraph Orchestration | ✅ done |
 | 16 | Clarification / Repair Agent | ✅ done |
 | 17 | FastAPI | ✅ done |
-| 18 | End-to-End Integration | ⬜ planned |
+| 18 | CLI | ✅ done |
+| 19 | End-to-End Integration | ⬜ planned |
 
 ## Requirements
 
@@ -67,14 +68,17 @@ camara-pgps --show-config
 pytest
 ```
 
-Run the services:
+Build the RAG knowledge base, then use the CLI or the services:
 
 ```bash
+python -m camara_pgps ingest-camara --reset
+python -m camara_pgps run --request "Improve the network quality for my video call"
+python -m camara_pgps list-apis --api quality-on-demand
+python -m camara_pgps show-config
+
 mock-camara                     # mock CAMARA gateway  -> http://localhost:8080/docs
 camara-pgps-api                 # the CAMARA-PGPS API  -> http://localhost:8000/docs
-
-curl -s localhost:8000/api/v1/run \
-  -H 'content-type: application/json' \
+curl -s localhost:8000/api/v1/run -H 'content-type: application/json' \
   -d '{"request": "Improve the network quality for my video call."}'
 ```
 
@@ -97,7 +101,7 @@ camara-pgps/
 ├── src/camara_pgps/     application package
 │   ├── __about__.py     version
 │   ├── config.py        pydantic-settings configuration
-│   ├── cli.py           console-script entry point
+│   ├── cli.py           `camara-pgps` CLI (run / list-apis / ingest-camara / show-config)
 │   ├── models/          shared domain models (intent, api, plan, state, …)
 │   ├── camara/          API registry, capability mapper & OpenAPI parser
 │   ├── retrieval/       ingestion, embeddings, ChromaDB retriever, RAG retrieval
