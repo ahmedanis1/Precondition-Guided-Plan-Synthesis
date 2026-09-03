@@ -2,14 +2,14 @@
 #
 # Convenience only - the primary local workflow is the conda environment
 # (see environment.yml). Service commands install the project in editable mode
-# on start, so the first boot is slow. The `mock_camara.app` and
-# `camara_pgps.api` targets are implemented in later milestones.
+# on start, so the first boot is slow. The `camara_pgps.api` target is
+# implemented in a later milestone.
 
 services:
   mock-camara:
     image: python:3.11-slim
     working_dir: /app
-    command: sh -c "pip install -e . && python -m uvicorn mock_camara.app:app --host 0.0.0.0 --port 8080"
+    command: sh -c "pip install -e . && python -m uvicorn mock_camara.main:app --host 0.0.0.0 --port 8080"
     volumes:
       - .:/app
     ports:

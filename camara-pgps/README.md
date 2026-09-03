@@ -28,9 +28,10 @@ plan is validated and executed against a CAMARA gateway (or the bundled mock).
 | 11 | PGPS Planner | ✅ done |
 | 12 | Plan Validator | ✅ done |
 | 13 | Execution Layer | ✅ done |
-| 14 | LangGraph Orchestration | ⬜ planned |
-| 15 | FastAPI + CLI | ⬜ planned |
-| 16 | End-to-End Integration | ⬜ planned |
+| 14 | Mock CAMARA Services | ✅ done |
+| 15 | LangGraph Orchestration | ⬜ planned |
+| 16 | FastAPI + CLI | ⬜ planned |
+| 17 | End-to-End Integration | ⬜ planned |
 
 ## Requirements
 
@@ -65,6 +66,13 @@ camara-pgps --show-config
 pytest
 ```
 
+Run the mock CAMARA gateway (the default execution target):
+
+```bash
+mock-camara                     # or: python -m uvicorn mock_camara.main:app --port 8080
+# docs at http://localhost:8080/docs
+```
+
 ## Configuration
 
 Settings resolve in this order (highest precedence first):
@@ -96,7 +104,7 @@ camara-pgps/
 ├── data/                local artefacts (vector store, knowledge graph) - gitignored
 │   └── registry/        camara_apis.json - the local API registry (tracked)
 ├── scripts/             environment / maintenance helpers
-├── mock_camara/         bundled mock CAMARA gateway
+├── mock_camara/         runnable mock CAMARA gateway (main.py + services/)
 ├── tests/               test suite
 ├── .env.example         environment-variable template
 ├── environment.yml      conda environment definition

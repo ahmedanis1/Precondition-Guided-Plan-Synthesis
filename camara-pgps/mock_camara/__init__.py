@@ -1,5 +1,6 @@
 """Bundled mock CAMARA gateway.
 
-A lightweight local stand-in for real CAMARA network APIs, used for development
-and end-to-end tests. The server implementation is added in a later milestone.
+A lightweight, stateful local stand-in for Device Location, Quality on Demand and
+Network Insights - a runnable target for the execution layer. The FastAPI app is
+``mock_camara.main:app``.
 """
