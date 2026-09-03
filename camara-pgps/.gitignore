@@ -24,6 +24,7 @@ condaenv.*.requirements.txt
 data/chroma/
 data/*.gml
 data/*.sqlite3
+data/camara_docs/
 
 # OS
 .DS_Store
