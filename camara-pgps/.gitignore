@@ -25,7 +25,9 @@ data/chroma/
 data/*.gml
 data/*.sqlite3
 data/camara_docs/
-
+data/conditions/
 # OS
 .DS_Store
 Thumbs.db
+design-decisions.md
+pgps-conditions-plan.md

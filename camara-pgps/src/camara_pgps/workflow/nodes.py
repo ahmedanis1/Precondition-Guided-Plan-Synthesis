@@ -11,13 +11,14 @@ from typing import Any
 
 from camara_pgps.agents.api_selection_agent import APISelectionAgent
 from camara_pgps.agents.intent_agent import IntentAgent
-from camara_pgps.agents.parameter_agent import ParameterExtractionAgent
+from camara_pgps.agents.parameter_agent import ParameterExtractionAgent, fact_for_parameter
 from camara_pgps.agents.repair_agent import RepairAgent
 from camara_pgps.camara.registry import CamaraRegistry
 from camara_pgps.config import Settings, get_settings
 from camara_pgps.execution import APIExecutor, build_executor
 from camara_pgps.models.plan import PlanRequest, PlanStatus
 from camara_pgps.models.state import AgentState, PipelineStage
+from camara_pgps.pgps.conditions_loader import build_condition_model
 from camara_pgps.pgps.explain import explain_plan
 from camara_pgps.pgps.planner import PGPSPlanner
 from camara_pgps.retrieval.rag import RagRetriever
@@ -62,20 +63,38 @@ def facts_from_arguments(
 
 
 def plan_missing_parameters(state: AgentState) -> list[str]:
-    """Required parameters of the *plan's* operations that are still unbound."""
+    """Required parameters of the *plan's* operations that are still unbound.
+
+    Parameter extraction runs *before* PGPS planning, against only the
+    operations API Selection picked - it has no idea PGPS might chain in an
+    extra step (e.g. "list sessions" ahead of "extend session") purely to
+    produce a fact a later step needs. So a name in ``missing_required`` is
+    only genuinely missing if nothing already known, and nothing an earlier
+    step in *this* plan produces, can supply it. Walking the plan in order
+    and accumulating facts (exactly as the planner itself does when building
+    steps) is what lets this recognise "PGPS's own plan will fetch this from
+    the API" and stop asking the person for something they never have to
+    provide - generically, for any operation/parameter, via the same
+    parameter<->fact convention parameter extraction itself binds from.
+    """
 
     if state.plan is None or state.parameters is None:
         return []
     supplied = state.supplied_arguments
+    known_facts = set(state.facts)
     missing: list[str] = []
     for step in state.plan.steps:
         op_params = state.parameters.for_operation(step.operation_id)
-        if op_params is None:
-            continue
-        covered = set(supplied.get(step.operation_id, {}))
-        for name in op_params.missing_required:
-            if name not in covered and name not in missing:
+        if op_params is not None:
+            covered = set(supplied.get(step.operation_id, {}))
+            for name in op_params.missing_required:
+                if name in covered or name in missing:
+                    continue
+                fact_key = fact_for_parameter(name)
+                if fact_key is not None and fact_key in known_facts:
+                    continue
                 missing.append(name)
+        known_facts |= set(step.produces)
     return missing
 
 
@@ -98,24 +117,59 @@ class WorkflowNodes:
     ) -> None:
         self.settings = settings or get_settings()
         self.registry = registry or CamaraRegistry.from_settings(self.settings)
-        self.intent_agent = intent_agent or IntentAgent.from_settings(self.settings)
-        self._rag = rag_retriever
+        self._intent_agent = intent_agent  # LLM-only; built lazily so the graph
+        self._rag = rag_retriever          # can be compiled without an LLM key
         self.selection_agent = selection_agent or APISelectionAgent(
-            registry=self.registry, settings=self.settings, rag=self._rag
+            settings=self.settings,
+            rag=self._rag,
         )
         self.parameter_agent = parameter_agent or ParameterExtractionAgent(
             registry=self.registry, settings=self.settings
         )
         self.planner = planner or PGPSPlanner(
-            registry=self.registry, settings=self.settings
+            registry=self.registry,
+            # Explicit, because passing only `registry=` here would make
+            # PGPSPlanner take its *legacy* from_registry() branch - building
+            # the condition model from CamaraOperation.preconditions /
+            # .postconditions on the registry object, which are empty for
+            # every RAG-reconstructed real CAMARA operation. That silently
+            # produced a PGPS that could never see any requires/produces at
+            # all (hence plans that never chained anything, and "no
+            # preconditions" in every explanation). PGPS's dependency
+            # knowledge must always come from data/conditions/ - `registry=`
+            # is kept alongside purely so the planner can still resolve
+            # method/path for an operation the solver discovers that wasn't
+            # itself a candidate.
+            condition_model=build_condition_model(settings=self.settings),
+            settings=self.settings,
         )
         self.validator = validator or PlanValidator(
-            registry=self.registry, settings=self.settings
+            registry=self.registry,
+            # Same reasoning as the planner above: without an explicit
+            # condition_model, PlanValidator falls back to building one from
+            # the registry's own (empty, for real operations) pre/post
+            # conditions, which silently turns its structural precondition
+            # check into a no-op instead of an independent check against the
+            # real data/conditions/ dependency graph.
+            condition_model=build_condition_model(settings=self.settings),
+            settings=self.settings,
         )
-        self.repair_agent = repair_agent or RepairAgent.from_settings(self.settings)
+        self._repair_agent = repair_agent
         self._executor = executor
 
-    # -- lazily built (touch external state) -------------------------------
+    # -- lazily built (may need an LLM / touch external state) --------------
+
+    @property
+    def intent_agent(self) -> IntentAgent:
+        if self._intent_agent is None:
+            self._intent_agent = IntentAgent.from_settings(self.settings)
+        return self._intent_agent
+
+    @property
+    def repair_agent(self) -> RepairAgent:
+        if self._repair_agent is None:
+            self._repair_agent = RepairAgent.from_settings(self.settings)
+        return self._repair_agent
 
     @property
     def rag(self) -> RagRetriever:
@@ -160,17 +214,8 @@ class WorkflowNodes:
         extraction = state.parameters
         if extraction is None:
             return []
-        families = (
-            set(state.intent.required_capabilities) if state.intent is not None else set()
-        )
         targets: set[str] = set()
-        if families:
-            targets = {
-                op.operation_id
-                for op in state.selected_operations
-                if self._family(self.registry.capability_of(op.operation_id)) in families
-            }
-        if not targets and state.selection is not None and state.selection.operations:
+        if state.selection is not None and state.selection.operations:
             targets = {state.selection.operations[0].operation_id}
 
         missing: list[str] = []
@@ -188,17 +233,15 @@ class WorkflowNodes:
             intent = self.intent_agent.understand(state.request_text)
         except Exception as exc:  # noqa: BLE001 - surface as a pipeline failure
             return self._fail("intent", exc)
-        facts = {**state.facts, **dict.fromkeys(intent.known_facts, True)}
         return {
             "intent": intent,
-            "facts": facts,
             "stage": PipelineStage.INTENT,
             "messages": [
                 {
                     "role": "system",
                     "content": (
-                        f"intent: goal={intent.goal!r} "
-                        f"capabilities={intent.required_capabilities}"
+                        f"intent: goal={intent.goal!r} action={intent.action!r} "
+                        f"entities={list(intent.entity_values())}"
                     ),
                 }
             ],
@@ -230,7 +273,10 @@ class WorkflowNodes:
         if state.stage is PipelineStage.FAILED or state.intent is None:
             return {}
         try:
-            selection = self.selection_agent.select(state.intent, rag_context=state.rag)
+            selection = self.selection_agent.select(
+                query=state.request_text,
+                intent=state.intent,
+            )
         except Exception as exc:  # noqa: BLE001
             return self._fail("selection", exc)
         operations = [candidate.operation for candidate in selection.operations]
@@ -242,8 +288,8 @@ class WorkflowNodes:
                 {
                     "role": "system",
                     "content": (
-                        f"selected apis={selection.api_names()} "
-                        f"operations={selection.operation_ids()}"
+                        f"selected apis={[api.name for api in selection.apis]} "
+                        f"operations={[op.operation_id for op in selection.operations]}"
                     ),
                 }
             ],
@@ -287,18 +333,6 @@ class WorkflowNodes:
         if state.stage is PipelineStage.FAILED or state.intent is None:
             return {}
 
-        # scope the candidate operations to the intent's capability families so the
-        # solver stays focused
-        operations = state.selected_operations
-        families = set(state.intent.required_capabilities)
-        if families:
-            scoped = [
-                op
-                for op in operations
-                if self._family(self.registry.capability_of(op.operation_id)) in families
-            ]
-            operations = scoped or operations
-
         # the goal is what the top-ranked selected operation produces
         goal_facts: list[str] = []
         selection = state.selection
@@ -310,7 +344,7 @@ class WorkflowNodes:
 
         request = PlanRequest(
             intent=state.intent,
-            candidate_operations=operations,
+            candidate_operations=state.selected_operations,
             retrieval=state.retrieval,
             known_facts=dict(state.facts),
             metadata={"goal_facts": goal_facts} if goal_facts else {},
@@ -422,6 +456,7 @@ class WorkflowNodes:
                 state.plan,
                 arguments=self._effective_arguments(state),
                 initial_facts=state.facts,
+                query=state.request_text,
             )
         except Exception as exc:  # noqa: BLE001
             return self._fail("execution", exc)

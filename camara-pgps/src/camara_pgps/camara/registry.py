@@ -83,9 +83,28 @@ class CamaraRegistry:
         return cls(document, source_path=resolved)
 
     @classmethod
+    def from_openapi_dir(cls, directory: str | Path, *, strict: bool = False) -> CamaraRegistry:
+        """Build the registry straight from the real CAMARA OpenAPI specs.
+
+        This is the live counterpart to :meth:`from_file`: instead of reading
+        a pre-built registry JSON that has to be hand-regenerated whenever an
+        API is added or changed, it parses every ``*.yaml`` spec in
+        ``directory`` fresh, via :func:`camara_pgps.camara.openapi_parser.build_registry`.
+        There is no static file that can go stale.
+        """
+
+        from camara_pgps.camara.openapi_parser import build_registry
+
+        resolved = _resolve(directory)
+        sources = sorted(resolved.glob("*.yaml"))
+        if not sources:
+            raise RegistryError(f"No OpenAPI specs (*.yaml) found in {resolved}")
+        return build_registry(sources, strict=strict)
+
+    @classmethod
     def from_settings(cls, settings: Settings | None = None) -> CamaraRegistry:
         settings = settings or get_settings()
-        return cls.from_file(settings.registry.path)
+        return cls.from_openapi_dir(settings.registry.specs_dir)
 
     # -- APIs ------------------------------------------------------------------
 

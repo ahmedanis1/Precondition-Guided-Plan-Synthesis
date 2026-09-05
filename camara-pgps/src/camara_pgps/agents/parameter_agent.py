@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 
 from camara_pgps.agents._llm import build_chat_model, chat_content, extract_json
 from camara_pgps.agents.api_selection_agent import APISelection
+from camara_pgps.pgps.parameter_facts import PARAMETER_TO_FACTS as _PARAM_FACTS
 from camara_pgps.camara.registry import CamaraRegistry
 from camara_pgps.config import Settings, get_settings
 from camara_pgps.models import (
@@ -58,7 +59,17 @@ _PARAM_ALIASES: dict[str, set[str]] = {
         "endpoint", "destination",
     },
     "qosprofile": {"qosprofile", "profile", "qos", "qosclass"},
-    "duration": {"duration", "time", "length", "period"},
+    "duration": {
+        "duration", "time", "length", "period",
+        # Real CAMARA operations name this field differently per API - the
+        # regex in _build_pool only ever populates the generic "duration"
+        # pool key, so every real name it can bind to has to be aliased here
+        # or a value like "30 minutes" grounds in the request text but never
+        # reaches the operation's actual parameter (e.g. extendQosSessionDuration's
+        # requestedAdditionalDuration).
+        "requestedadditionalduration", "additionalduration",
+        "requestedduration", "sessionduration", "durationseconds",
+    },
     "area": {"area", "location", "region", "zone", "geofence", "coordinates", "place"},
     "sessionid": {"sessionid", "session"},
     "subscriptionid": {"subscriptionid", "subscription"},
@@ -68,13 +79,11 @@ _PARAM_ALIASES: dict[str, set[str]] = {
     "types": {"types", "eventtypes", "kinds"},
 }
 
-# resolved parameter (normalised) -> fact keys it satisfies (shared fact-key convention)
-_PARAM_FACTS: dict[str, tuple[str, ...]] = {
-    "device": ("device.identifier",),
-    "sessionid": ("qos.session.id",),
-    "qosprofile": ("qos.profile",),
-    "subscriptionid": ("network-insights.subscription.id",),
-}
+# _PARAM_FACTS (resolved parameter, normalised -> fact keys it satisfies) is
+# now imported above from pgps.parameter_facts - the single, shared table
+# also used by the planner (to record cross-step bindings) and the executor
+# (to substitute a fact into a raw path/query parameter), so a fact
+# recognised in one place is always recognised in all of them.
 
 # reverse: fact key -> the parameter (normalised) it can fill
 _FACT_PARAM: dict[str, str] = {
@@ -140,6 +149,19 @@ class ParameterExtraction(BaseModel):
 
 def _norm(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def fact_for_parameter(name: str) -> str | None:
+    """The fact key a raw parameter name resolves to, if any.
+
+    Thin re-export of ``pgps.parameter_facts.fact_for_parameter`` under this
+    module's existing name/normalisation, so callers that already imported
+    it from here (PGPS plan routing, in ``workflow/nodes.py``) don't need to
+    change - it now resolves from the single shared table.
+    """
+
+    facts = _PARAM_FACTS.get(_norm(name))
+    return facts[0] if facts else None
 
 
 def _alias_group(param_name: str) -> set[str]:
@@ -345,7 +367,6 @@ class ParameterExtractionAgent:
             notes=notes,
             metadata={
                 "extractor": type(self.extractor).__name__,
-                "intent_missing_information": list(resolved_intent.missing_information),
                 "operations": [op.operation_id for op in ops],
             },
         )
@@ -363,14 +384,37 @@ class ParameterExtractionAgent:
         self, operations: APISelection | Sequence[CamaraOperation | str]
     ) -> list[CamaraOperation]:
         if isinstance(operations, APISelection):
-            return [item.operation for item in operations.operations]
-        resolved: list[CamaraOperation] = []
-        for entry in operations:
-            if isinstance(entry, CamaraOperation):
-                resolved.append(entry)
-            else:
-                resolved.append(self.registry.require_operation(str(entry)))
-        return resolved
+            candidates = [item.operation for item in operations.operations]
+        else:
+            candidates = [
+                entry
+                if isinstance(entry, CamaraOperation)
+                else self.registry.require_operation(str(entry))
+                for entry in operations
+            ]
+        return [self._prefer_registry_shape(op) for op in candidates]
+
+    def _prefer_registry_shape(self, operation: CamaraOperation) -> CamaraOperation:
+        """Use the registry's parameter list instead of RAG's, when available.
+
+        RAG deliberately reconstructs operations from JSONL alone (see
+        ``RagRetriever``'s docstring) so it can surface an operation that
+        isn't in the registry yet - but the JSONL corpus's structured payload
+        never resolves a request body's ``schema_ref`` into individual
+        fields, so a RAG-reconstructed operation can be missing required body
+        parameters entirely (e.g. ``createQosAssignment`` shows up with only
+        its header parameter, never ``qosProfile``). The registry - built
+        fresh from the real OpenAPI specs - always has the true, complete
+        parameter list, so binding/missing-detection should trust it over
+        RAG whenever the operation is registered. Anything RAG found that
+        isn't in the registry yet falls back to RAG's own shape unchanged,
+        preserving the same "JSONL as source of truth" guarantee RAG itself
+        provides.
+        """
+
+        if self.registry.has_operation(operation.operation_id):
+            return self.registry.get_operation(operation.operation_id) or operation
+        return operation
 
     def _build_pool(
         self, intent: Intent, prior_facts: dict[str, Any]
@@ -551,4 +595,5 @@ __all__ = [
     "RuleBasedParameterExtractor",
     "LLMParameterExtractor",
     "get_parameter_agent",
+    "fact_for_parameter",
 ]

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import pytest
+from conftest import stub_intent_agent
 
+from camara_pgps.agents import RepairAgent
 from camara_pgps.camara.registry import CamaraRegistry
 from camara_pgps.config import PROJECT_ROOT
 from camara_pgps.execution import MockExecutor
@@ -46,7 +48,11 @@ def nodes(tmp_path, registry: CamaraRegistry) -> WorkflowNodes:
         retriever=Retriever(vector_store=store, embedder=embedder), registry=registry
     )
     return WorkflowNodes(
-        registry=registry, rag_retriever=rag, executor=MockExecutor(registry=registry)
+        registry=registry,
+        rag_retriever=rag,
+        executor=MockExecutor(registry=registry),
+        intent_agent=stub_intent_agent(),
+        repair_agent=RepairAgent(registry=registry),
     )
 
 

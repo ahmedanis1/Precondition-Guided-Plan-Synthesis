@@ -60,12 +60,22 @@ _ANSWERING_RE = re.compile(
 )
 
 _SYSTEM_PROMPT = (
-    "You write ONE short, polite sentence asking a user to provide the listed "
-    "pieces of information so a task can continue.\n"
+    "You write ONE short, plain-language question asking a user to provide the "
+    "listed pieces of information so their request can be completed.\n"
+    "Each item includes its raw CAMARA API name and, when available, the real "
+    "API description of what it technically means. The user is almost never a "
+    "telecom engineer - use the description to explain what to supply using "
+    "everyday words tied to what they're actually trying to do, instead of "
+    "repeating the raw API terminology back at them. For example, an "
+    "'applicationServer' field described as identifying the backend server the "
+    "device will connect to should be asked for as something like the address "
+    "of the service they'll be using (e.g. their video-call app or streaming "
+    "service), not as \"the application server address\".\n"
     "Rules:\n"
     "- Do NOT invent, assume, guess or fill in any value.\n"
     "- Do NOT answer on the user's behalf.\n"
-    "- Only ask for what is listed. No preamble, no bullet points."
+    "- Only ask for what is listed. No preamble, no bullet points.\n"
+    "- One or two sentences at most."
 )
 
 
@@ -163,12 +173,25 @@ class LLMPhraser:
         try:
             from langchain_core.messages import HumanMessage, SystemMessage
 
-            listing = "\n".join(
-                f"- {item.label}"
-                + (f" (one of: {', '.join(map(str, item.enum))})" if item.enum else "")
-                for item in items
+            def _describe(item: MissingItem) -> str:
+                line = f"- {item.label} (API name: {item.name})"
+                if item.enum:
+                    line += f" (one of: {', '.join(map(str, item.enum))})"
+                if item.description:
+                    # OpenAPI descriptions can run to several sentences/
+                    # paragraphs of spec prose - the LLM only needs enough to
+                    # explain the field, not the whole schema doc.
+                    first_para = item.description.strip().split("\n\n")[0]
+                    first_sentence = " ".join(first_para.split())
+                    line += f"\n  API description: {first_sentence}"
+                return line
+
+            listing = "\n".join(_describe(item) for item in items)
+            human = (
+                f"User's request: {request_text!r}\n"
+                f"What they're trying to do: {goal or 'unspecified'}\n"
+                f"Still needed:\n{listing}"
             )
-            human = f"User's request: {request_text!r}\nStill needed:\n{listing}"
             response = self._model.invoke(
                 [SystemMessage(content=_SYSTEM_PROMPT), HumanMessage(content=human)]
             )

@@ -1,28 +1,28 @@
-"""API Selection agent (milestone 8).
+"""RAG-grounded CAMARA API selection agent.
 
-Position in the pipeline::
+Architecture:
 
-    Intent agent -> RAG -> API Selection agent -> CAMARA registry
+    Intent + RagContext
+        -> candidate extraction from RAG
+        -> deterministic relevance filtering
+        -> LLM selection from RAG candidates only
+        -> structured APISelection
+        -> Parameter Resolver
 
-Given an :class:`~camara_pgps.models.Intent` (and the RAG evidence for it) this
-identifies **candidate** CAMARA APIs and operations. It narrows; it does not
-order them and does not build a plan.
-
-Safety boundary: every name - whether it came from the intent, from RAG, or from
-an LLM - is verified against the registry before it can become a candidate::
-
-    suggestion -> registry verification -> valid CAMARA API
-
-Anything the registry does not recognise is recorded in
-:attr:`APISelection.rejected`, never returned as a candidate.
+The agent does NOT:
+    - use CamaraRegistry for runtime validation
+    - invent APIs or operations
+    - resolve API parameters
+    - select QoS profiles
+    - create execution plans
+    - execute API calls
 """
 
 from __future__ import annotations
 
 import logging
-import re
-from enum import StrEnum
-from functools import lru_cache
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -36,458 +36,831 @@ from camara_pgps.retrieval.rag import RagContext, RagRetriever
 logger = logging.getLogger(__name__)
 
 
-class SelectionSource(StrEnum):
-    """Where a candidate suggestion originated."""
+# ---------------------------------------------------------------------------
+# Selection source
+# ---------------------------------------------------------------------------
 
-    INTENT = "intent"
+
+class SelectionSource(str, Enum):
     RAG = "rag"
     LLM = "llm"
 
 
-_SOURCE_WEIGHT = {
-    SelectionSource.RAG: 1.0,
-    SelectionSource.INTENT: 0.9,
-    SelectionSource.LLM: 0.7,
-}
-_OPERATION_API_BOOST = 0.25
-
-_SELECTION_PROMPT = """You narrow a user request down to CANDIDATE CAMARA APIs and operations.
-You do NOT order them. You do NOT build an execution plan. You only shortlist.
-
-Choose ONLY from the registered names provided. Prefer fewer, well-justified
-candidates. Return ONLY a JSON object:
-  {{"apis": ["<registered api name>", ...],
-    "operations": ["<registered operationId>", ...],
-    "rationale": "<one sentence>"}}
-
-Registered APIs: {apis}
-Registered operations: {operations}"""
+# ---------------------------------------------------------------------------
+# Candidate models
+# ---------------------------------------------------------------------------
 
 
-# --------------------------------------------------------------------------- #
-# result models
-# --------------------------------------------------------------------------- #
+class CandidateOperation(BaseModel):
+    """An operation retrieved from the CAMARA knowledge base."""
+
+    operation_id: str
+    api_name: str
+    operation: CamaraOperation
+    score: float = 0.0
+    sources: list[SelectionSource] = Field(default_factory=list)
+    capability: str | None = None
+    reason: str | None = None
+
 
 class CandidateAPI(BaseModel):
-    """A registry-verified candidate API."""
+    """An API that contains one or more relevant operations."""
 
     name: str
-    api: CamaraAPI
-    score: float
+    score: float = 0.0
     sources: list[SelectionSource] = Field(default_factory=list)
     operation_ids: list[str] = Field(default_factory=list)
     reason: str | None = None
 
 
-class CandidateOperation(BaseModel):
-    """A registry-verified candidate operation."""
-
-    operation_id: str
-    api_name: str
-    operation: CamaraOperation
-    capability: str | None = None
-    score: float = 0.0
-    sources: list[SelectionSource] = Field(default_factory=list)
-
-
-class RejectedSuggestion(BaseModel):
-    """A suggested name that the registry did not recognise."""
-
-    name: str
-    kind: str  # "api" | "operation" | "capability"
-    source: SelectionSource
-    reason: str = "not found in CAMARA registry"
-
-
 class APISelection(BaseModel):
-    """Candidate APIs / operations for one intent - a shortlist, not a plan."""
+    """Result returned by the API Selection Agent."""
 
     query: str
-    intent: Intent | None = None
     apis: list[CandidateAPI] = Field(default_factory=list)
     operations: list[CandidateOperation] = Field(default_factory=list)
-    rejected: list[RejectedSuggestion] = Field(default_factory=list)
+    rejected: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
-    def api_names(self) -> list[str]:
-        return [item.name for item in self.apis]
 
-    def operation_ids(self) -> list[str]:
-        return [item.operation_id for item in self.operations]
-
-    def get_api(self, name: str) -> CandidateAPI | None:
-        return next((item for item in self.apis if item.name == name), None)
+# ---------------------------------------------------------------------------
+# LLM output schema
+# ---------------------------------------------------------------------------
 
 
-# --------------------------------------------------------------------------- #
-# helpers
-# --------------------------------------------------------------------------- #
+class LLMOperationChoice(BaseModel):
+    """Structured output expected from the LLM."""
 
-def _slugify(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", text.strip().lower()).strip("-")
-
-
-def _family_of(capability: str) -> str:
-    return capability.split(".", 1)[0]
+    selected_operation_ids: list[str] = Field(default_factory=list)
+    reason: str = ""
+    confidence: float | None = None
 
 
-def _apis_for_family(registry: CamaraRegistry, family: str) -> set[str]:
-    apis: set[str] = set()
-    for capability in registry.capabilities():
-        if _family_of(capability) != family:
-            continue
-        for operation in registry.operations_for_capability(capability):
-            if operation.api_name:
-                apis.add(operation.api_name)
-    return apis
+# ---------------------------------------------------------------------------
+# Internal candidate representation
+# ---------------------------------------------------------------------------
 
 
-def _canonical_api(registry: CamaraRegistry, text: str) -> str | None:
-    """Resolve an arbitrary API reference to a registered API name, or ``None``."""
-
-    candidate = text.strip()
-    if not candidate:
-        return None
-    if registry.has_api(candidate):
-        return candidate
-    slug = _slugify(candidate)
-    if slug and registry.has_api(slug):
-        return slug
-    lowered = candidate.lower()
-    for name in registry.api_names():
-        api = registry.get_api(name)
-        if name.lower() == lowered or name.replace("-", " ").lower() == lowered:
-            return name
-        if api is not None and api.title and api.title.lower() == lowered:
-            return name
-    return None
+@dataclass
+class _RagCandidate:
+    operation_id: str
+    api_name: str
+    operation: CamaraOperation
+    score: float
+    capability: str | None = None
 
 
-def _canonical_operation(registry: CamaraRegistry, text: str) -> str | None:
-    candidate = text.strip()
-    if not candidate:
-        return None
-    if registry.has_operation(candidate):
-        return candidate
-    lowered = candidate.lower()
-    return next(
-        (oid for oid in registry.operation_ids() if oid.lower() == lowered),
-        None,
-    )
+# ---------------------------------------------------------------------------
+# Prompt
+# ---------------------------------------------------------------------------
 
 
-# --------------------------------------------------------------------------- #
-# optional LLM selector
-# --------------------------------------------------------------------------- #
+_SELECTION_PROMPT = """
+You are the CAMARA API Selection Agent.
+
+Your ONLY responsibility is to select the CAMARA operation(s) that best
+match the user's intent.
+
+You are given:
+1. The user's intent.
+2. Operations retrieved from the CAMARA RAG knowledge base.
+
+IMPORTANT RULES:
+
+- You MUST select ONLY from the provided candidate operations.
+- NEVER invent an API name.
+- NEVER invent an operation ID.
+- NEVER select an operation that is not in the candidate list.
+- Do NOT resolve API parameters.
+- Do NOT create parameter values.
+- Do NOT select a QoS profile.
+- Do NOT create an execution plan.
+- Do NOT execute an API.
+- Do NOT use outside CAMARA knowledge.
+- Use the operation descriptions, HTTP methods, paths, and parameters
+  provided in the candidates.
+- Prefer the operation that directly satisfies the user's request.
+- If the user asks to discover/list available resources, prefer a
+  retrieval/list operation over an operation that retrieves one specific
+  resource.
+- If an operation requires a specific identifier that the user has not
+  provided, do not prefer it over an operation that can discover resources.
+- Return multiple operations ONLY when the user's intent clearly requires
+  multiple distinct operations.
+
+Return JSON only:
+
+{
+  "selected_operation_ids": ["operation-id"],
+  "reason": "short explanation",
+  "confidence": 0.0
+}
+
+The selected operation IDs MUST exactly match IDs from the candidate list.
+"""
+
+
+# ---------------------------------------------------------------------------
+# LLM selector
+# ---------------------------------------------------------------------------
+
+
+# Selection only has to pick among candidates - it does not need the full
+# operation text. Parameter extraction (registry-shape) and execution
+# (conditions + real registry) already carry the complete detail later, so
+# capping what goes into this prompt keeps it well clear of the model's
+# context window regardless of how many verbose candidates RAG returns.
+_MAX_CANDIDATE_TEXT_CHARS = 160
+
+
+def _truncate(text: str | None, limit: int = _MAX_CANDIDATE_TEXT_CHARS) -> str:
+    if not text:
+        return ""
+    text = " ".join(text.split())  # collapse whitespace/newlines
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0]
+    return f"{cut}..."
+
 
 class LLMApiSelector:
-    """Asks a chat model to shortlist APIs / operations from the registered names."""
+    """Select operations using an LLM constrained to RAG candidates."""
 
-    def __init__(self, model: Any, registry: CamaraRegistry) -> None:
+    def __init__(self, model: Any):
         self._model = model
-        self._registry = registry
 
-    def propose(
-        self, intent: Intent, rag_context: RagContext
-    ) -> tuple[list[str], list[str], str]:
+    def select(
+        self,
+        intent: Intent,
+        candidates: list[_RagCandidate],
+    ) -> LLMOperationChoice:
+        if not candidates:
+            return LLMOperationChoice(
+                selected_operation_ids=[],
+                reason="No relevant RAG candidates were available.",
+                confidence=0.0,
+            )
+
+        candidate_text = self._format_candidates(candidates)
+
+        prompt_body = f"""
+USER INTENT
+-----------
+Goal: {getattr(intent, "goal", "")}
+Action: {getattr(intent, "action", "")}
+
+Entities:
+{self._format_entities(intent)}
+
+Constraints:
+{self._format_constraints(intent)}
+
+RAG CANDIDATE OPERATIONS
+------------------------
+{candidate_text}
+"""
+
         try:
-            data = extract_json(self._invoke(intent, rag_context))
-            apis = [str(x) for x in data.get("apis", []) if str(x).strip()]
-            operations = [str(x) for x in data.get("operations", []) if str(x).strip()]
-            return apis, operations, str(data.get("rationale", "")).strip()
-        except Exception as exc:  # noqa: BLE001 - degrade to intent + RAG only
-            logger.warning("LLM API selection failed (%s); using intent + RAG only", exc)
-            return [], [], ""
+            # NOTE: OllamaChatModel.invoke() expects a list of messages, not a
+            # raw string - passing a plain string here used to make it iterate
+            # the prompt *character by character* (str is iterable), sending
+            # one single-character "user" message per character instead of
+            # one real message. That silently multiplied the prompt several
+            # times over once Ollama's chat template added per-turn framing
+            # to every one of those messages, which is what was actually
+            # blowing prompts up to (and past) the model's context window.
+            from langchain_core.messages import HumanMessage, SystemMessage
 
-    def _invoke(self, intent: Intent, rag_context: RagContext) -> str:
-        from langchain_core.messages import HumanMessage, SystemMessage
+            response = self._model.invoke(
+                [
+                    SystemMessage(content=_SELECTION_PROMPT),
+                    HumanMessage(content=prompt_body),
+                ]
+            )
+            content = chat_content(response)
+        except Exception as exc:
+            # A slow/unreachable LLM (e.g. Ollama cold-loading a model, or a
+            # timeout) must not sink the whole request when RAG already
+            # found grounded candidates - fall back to the top-ranked one.
+            logger.warning(
+                "API selection LLM call failed (%s: %s); falling back to "
+                "top-ranked RAG candidate(s)",
+                type(exc).__name__,
+                exc,
+            )
+            return self._fallback_choice(
+                candidates,
+                reason=(
+                    f"API selection model was unavailable ({type(exc).__name__}); "
+                    "used the top-ranked RAG result instead."
+                ),
+            )
 
-        system = _SELECTION_PROMPT.format(
-            apis=", ".join(self._registry.api_names()),
-            operations=", ".join(self._registry.operation_ids()),
+        try:
+            data = extract_json(content)
+            return LLMOperationChoice.model_validate(data)
+        except Exception as exc:
+            logger.warning("Failed to parse API selection LLM output: %s", exc)
+
+            return self._fallback_choice(
+                candidates,
+                reason=(
+                    "API selection model returned an invalid response; "
+                    "used the top-ranked RAG result instead."
+                ),
+            )
+
+    @staticmethod
+    def _fallback_choice(
+        candidates: list[_RagCandidate],
+        *,
+        reason: str,
+    ) -> LLMOperationChoice:
+        """Deterministic fallback: trust the RAG ranking rather than failing outright.
+
+        Never invents an operation - only ever returns an operation_id that was
+        already in the RAG candidate list, same grounding guarantee as the LLM path.
+        """
+
+        top = sorted(candidates, key=lambda c: c.score, reverse=True)[:1]
+
+        return LLMOperationChoice(
+            selected_operation_ids=[c.operation_id for c in top],
+            reason=reason,
+            confidence=0.0,
         )
-        human = (
-            f"Goal: {intent.goal}\n"
-            f"Required capabilities: {intent.required_capabilities}\n"
-            f"Constraints: {intent.constraints}\n\n"
-            f"{rag_context.as_prompt_context()}"
-        )
-        response = self._model.invoke(
-            [SystemMessage(content=system), HumanMessage(content=human)]
-        )
-        return chat_content(response)
+
+    @staticmethod
+    def _format_candidates(candidates: list[_RagCandidate]) -> str:
+        blocks: list[str] = []
+
+        for index, candidate in enumerate(candidates, start=1):
+            operation = candidate.operation
+
+            method = getattr(operation, "method", None)
+            path = getattr(operation, "path", None)
+            description = _truncate(getattr(operation, "description", None))
+
+            # `capability` falls back to the full description when the RAG
+            # item has no distinct capability tag (see _get_rag_candidates) -
+            # in that case it would just repeat the description line, so
+            # skip it rather than doubling this candidate's prompt cost.
+            capability = _truncate(candidate.capability)
+            capability_line = (
+                f"capability: {capability}\n" if capability and capability != description else ""
+            )
+
+            blocks.append(
+                f"""
+Candidate {index}
+operation_id: {candidate.operation_id}
+api_name: {candidate.api_name}
+{capability_line}method: {method or ""}
+path: {path or ""}
+description: {description}
+rag_score: {candidate.score:.4f}
+"""
+            )
+
+        return "\n".join(blocks)
+
+    @staticmethod
+    def _format_entities(intent: Intent) -> str:
+        entities = getattr(intent, "entities", [])
+
+        if not entities:
+            return "None"
+
+        lines = []
+
+        for entity in entities:
+            if hasattr(entity, "name"):
+                name = entity.name
+                value = getattr(entity, "value", None)
+            else:
+                name = entity.get("name", "")
+                value = entity.get("value")
+
+            lines.append(f"- {name}: {value}")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_constraints(intent: Intent) -> str:
+        constraints = getattr(intent, "constraints", [])
+
+        if not constraints:
+            return "None"
+
+        lines = []
+
+        for constraint in constraints:
+            if hasattr(constraint, "type"):
+                constraint_type = constraint.type
+                value = getattr(constraint, "value", None)
+                unit = getattr(constraint, "unit", None)
+            else:
+                constraint_type = constraint.get("type", "")
+                value = constraint.get("value")
+                unit = constraint.get("unit")
+
+            unit_text = f" {unit}" if unit else ""
+
+            lines.append(
+                f"- {constraint_type}: {value}{unit_text}"
+            )
+
+        return "\n".join(lines)
 
 
-# --------------------------------------------------------------------------- #
-# agent
-# --------------------------------------------------------------------------- #
-
-class _Accumulator:
-    __slots__ = ("score", "sources")
-
-    def __init__(self) -> None:
-        self.score = 0.0
-        self.sources: set[SelectionSource] = set()
-
-    def add(self, source: SelectionSource, weight: float) -> None:
-        self.score += weight
-        self.sources.add(source)
+# ---------------------------------------------------------------------------
+# API Selection Agent
+# ---------------------------------------------------------------------------
 
 
 class APISelectionAgent:
-    """Intent (+ RAG) -> registry-verified :class:`APISelection`."""
+    """Select CAMARA operations using RAG-grounded candidate selection."""
 
     def __init__(
         self,
         *,
-        registry: CamaraRegistry | None = None,
         rag: RagRetriever | None = None,
         llm: Any | None = None,
         selector: LLMApiSelector | None = None,
         settings: Settings | None = None,
-        max_apis: int = 5,
-        max_operations: int = 12,
-    ) -> None:
-        self.settings = settings or get_settings()
-        self.registry = registry or CamaraRegistry.from_settings(self.settings)
-        self._rag = rag
-        self.max_apis = max_apis
-        self.max_operations = max_operations
-        if selector is not None:
-            self.selector: LLMApiSelector | None = selector
-        elif llm is not None:
-            self.selector = LLMApiSelector(llm, self.registry)
-        else:
-            self.selector = None
+        max_candidates: int = 12,
+        max_selected: int = 5,
+    ):
+        self.settings = settings or Settings()
+        self.rag = rag or RagRetriever.from_settings(self.settings)
+
+        self.llm = llm or build_chat_model(
+            self.settings,
+            purpose="API selection agent",
+        )
+
+        self.selector = selector or LLMApiSelector(self.llm)
+
+        self.max_candidates = max_candidates
+        self.max_selected = max_selected
 
     @classmethod
-    def from_settings(cls, settings: Settings | None = None) -> APISelectionAgent:
-        settings = settings or get_settings()
+    def from_settings(
+        cls,
+        settings: Settings | None = None,
+    ) -> "APISelectionAgent":
+        settings = settings or Settings()
+
         return cls(
-            llm=build_chat_model(settings, purpose="API selection agent"),
             settings=settings,
         )
 
-    # -- public -----------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def select(
         self,
-        intent: Intent | str,
-        *,
-        rag_context: RagContext | None = None,
+        query: str,
+        intent: Intent | None = None,
     ) -> APISelection:
-        resolved_intent = self._as_intent(intent)
-        rag = rag_context or self._get_rag().retrieve(resolved_intent)
+        """Select the most relevant CAMARA operation(s).
 
-        rejected: list[RejectedSuggestion] = []
-        notes: list[str] = []
+        Flow:
 
-        api_suggestions = self._api_suggestions(resolved_intent, rag)
-        op_suggestions = self._operation_suggestions(resolved_intent, rag)
+            Intent
+                +
+            RAG
+                ↓
+            candidate operations
+                ↓
+            relevance filtering
+                ↓
+            LLM selection
+                ↓
+            structured APISelection
+        """
 
-        rationale = ""
-        if self.selector is not None:
-            llm_apis, llm_ops, rationale = self.selector.propose(resolved_intent, rag)
-            api_suggestions.extend((name, SelectionSource.LLM) for name in llm_apis)
-            op_suggestions.extend((oid, SelectionSource.LLM) for oid in llm_ops)
-
-        # ---- registry verification (the safety boundary) ----
-        api_acc = self._verify_apis(api_suggestions, rejected)
-        op_acc = self._verify_operations(op_suggestions, rejected)
-
-        # operations of a shortlisted API whose capability the intent asked for
-        self._add_capability_operations(resolved_intent, api_acc, op_acc)
-
-        operations = self._rank_operations(op_acc)
-        for candidate in operations:
-            api_acc.setdefault(candidate.api_name, _Accumulator()).score += (
-                _OPERATION_API_BOOST
+        if intent is None:
+            raise ValueError(
+                "APISelectionAgent requires an Intent. "
+                "Intent extraction must happen before API selection."
             )
 
-        apis = self._rank_apis(api_acc, operations, rationale)
+        # --------------------------------------------------------------
+        # 1. Get candidates from RAG
+        # --------------------------------------------------------------
+
+        rag_context = self.rag.retrieve(
+            intent or query,
+        )
+
+        candidates = self._get_rag_candidates(rag_context)
+
+        if not candidates:
+            return APISelection(
+                query=query,
+                notes=["RAG returned no candidate operations."],
+                metadata={
+                    "stage": "api-selection",
+                    "candidate_count": 0,
+                },
+            )
+
+        # --------------------------------------------------------------
+        # 2. Remove obviously irrelevant candidates
+        # --------------------------------------------------------------
+
+        filtered = self._filter_candidates(
+            intent=intent,
+            candidates=candidates,
+        )
+
+        # Never leave the LLM with an empty candidate set if RAG found
+        # something. This fallback preserves recall.
+        if not filtered:
+            filtered = candidates[: self.max_candidates]
+
+        # --------------------------------------------------------------
+        # 3. Give ONLY filtered RAG candidates to LLM
+        # --------------------------------------------------------------
+
+        llm_result = self.selector.select(
+            intent=intent,
+            candidates=filtered,
+        )
+
+        # --------------------------------------------------------------
+        # 4. Validate LLM selections
+        # --------------------------------------------------------------
+
+        candidate_by_id = {
+            candidate.operation_id: candidate
+            for candidate in filtered
+        }
+
+        selected_ids = []
+
+        for operation_id in llm_result.selected_operation_ids:
+            if operation_id not in candidate_by_id:
+                logger.warning(
+                    "LLM selected operation not present in RAG candidates: %s",
+                    operation_id,
+                )
+                continue
+
+            if operation_id not in selected_ids:
+                selected_ids.append(operation_id)
+
+            if len(selected_ids) >= self.max_selected:
+                break
+
+        # --------------------------------------------------------------
+        # 5. Convert to structured CandidateOperation
+        # --------------------------------------------------------------
+
+        operations: list[CandidateOperation] = []
+
+        for operation_id in selected_ids:
+            candidate = candidate_by_id[operation_id]
+
+            operations.append(
+                CandidateOperation(
+                    operation_id=candidate.operation_id,
+                    api_name=candidate.api_name,
+                    operation=candidate.operation,
+                    score=candidate.score,
+                    sources=[
+                        SelectionSource.RAG,
+                        SelectionSource.LLM,
+                    ],
+                    capability=candidate.capability,
+                    reason=llm_result.reason,
+                )
+            )
+
+        # --------------------------------------------------------------
+        # Build API-level candidates from selected operations
+        # --------------------------------------------------------------
+
+        apis = self._build_api_candidates(operations)
+
+        rejected = [
+            candidate.operation_id
+            for candidate in filtered
+            if candidate.operation_id not in selected_ids
+        ]
 
         return APISelection(
-            query=resolved_intent.text or resolved_intent.goal,
-            intent=resolved_intent,
+            query=query,
             apis=apis,
             operations=operations,
             rejected=rejected,
-            notes=notes,
+            notes=[
+                llm_result.reason
+                if llm_result.reason
+                else "Operations selected from RAG candidates."
+            ],
             metadata={
-                "llm_rationale": rationale,
-                "used_llm": self.selector is not None,
-                "candidate_api_count": len(apis),
+                "stage": "api-selection",
+                "candidate_count": len(candidates),
+                "filtered_candidate_count": len(filtered),
+                "selected_operation_count": len(operations),
+                "selection_source": "rag+llm",
+                "registry_used": False,
             },
         )
 
-    # -- suggestion gathering -------------------------------------------------
+    # ------------------------------------------------------------------
+    # RAG candidate extraction
+    # ------------------------------------------------------------------
 
-    @staticmethod
-    def _as_intent(intent: Intent | str) -> Intent:
-        if isinstance(intent, Intent):
-            return intent
-        text = str(intent)
-        return Intent(text=text, goal=text)
-
-    def _get_rag(self) -> RagRetriever:
-        if self._rag is None:
-            self._rag = RagRetriever.from_settings(self.settings)
-        return self._rag
-
-    def _api_suggestions(
-        self, intent: Intent, rag: RagContext
-    ) -> list[tuple[str, SelectionSource]]:
-        suggestions: list[tuple[str, SelectionSource]] = []
-        for domain in intent.target_domains:
-            suggestions.append((domain, SelectionSource.INTENT))
-        for family in intent.required_capabilities:
-            for api_name in _apis_for_family(self.registry, family):
-                suggestions.append((api_name, SelectionSource.INTENT))
-        for api_name in rag.apis:
-            suggestions.append((api_name, SelectionSource.RAG))
-        for item in rag.operations:
-            if item.api_name:
-                suggestions.append((item.api_name, SelectionSource.RAG))
-        return suggestions
-
-    @staticmethod
-    def _operation_suggestions(
-        intent: Intent, rag: RagContext
-    ) -> list[tuple[str, SelectionSource]]:
-        return [
-            (item.operation.operation_id, SelectionSource.RAG) for item in rag.operations
-        ]
-
-    # -- verification ------------------------------------------------------
-
-    def _verify_apis(
+    def _get_rag_candidates(
         self,
-        suggestions: list[tuple[str, SelectionSource]],
-        rejected: list[RejectedSuggestion],
-    ) -> dict[str, _Accumulator]:
-        accumulators: dict[str, _Accumulator] = {}
-        seen_rejects: set[tuple[str, SelectionSource]] = set()
-        for raw_name, source in suggestions:
-            canonical = _canonical_api(self.registry, raw_name)
-            if canonical is None:
-                key = (raw_name.strip().lower(), source)
-                if key not in seen_rejects and raw_name.strip():
-                    seen_rejects.add(key)
-                    rejected.append(
-                        RejectedSuggestion(name=raw_name, kind="api", source=source)
-                    )
+        rag_context: RagContext,
+    ) -> list[_RagCandidate]:
+        """Extract operation candidates from RagContext."""
+
+        candidates: list[_RagCandidate] = []
+
+        # --------------------------------------------------------------
+        # Direct operation results
+        # --------------------------------------------------------------
+
+        for item in getattr(rag_context, "operations", []) or []:
+            operation = getattr(item, "operation", None)
+
+            if operation is None:
                 continue
-            accumulators.setdefault(canonical, _Accumulator()).add(
-                source, _SOURCE_WEIGHT[source]
-            )
-        return accumulators
 
-    def _verify_operations(
-        self,
-        suggestions: list[tuple[str, SelectionSource]],
-        rejected: list[RejectedSuggestion],
-    ) -> dict[str, _Accumulator]:
-        accumulators: dict[str, _Accumulator] = {}
-        seen_rejects: set[tuple[str, SelectionSource]] = set()
-        for raw_id, source in suggestions:
-            canonical = _canonical_operation(self.registry, raw_id)
-            if canonical is None:
-                key = (raw_id.strip().lower(), source)
-                if key not in seen_rejects and raw_id.strip():
-                    seen_rejects.add(key)
-                    rejected.append(
-                        RejectedSuggestion(
-                            name=raw_id, kind="operation", source=source
-                        )
-                    )
+            operation_id = (
+                getattr(item, "operation_id", None)
+                or getattr(operation, "operation_id", None)
+                or getattr(operation, "id", None)
+            )
+
+            api_name = (
+                getattr(item, "api_name", None)
+                or getattr(operation, "api_name", None)
+                or getattr(operation, "api", None)
+            )
+
+            if not operation_id or not api_name:
                 continue
-            accumulators.setdefault(canonical, _Accumulator()).add(
-                source, _SOURCE_WEIGHT[source]
+
+            score = float(
+                getattr(item, "score", None)
+                or getattr(item, "similarity", None)
+                or 0.0
             )
-        return accumulators
 
-    def _add_capability_operations(
-        self,
-        intent: Intent,
-        api_acc: dict[str, _Accumulator],
-        op_acc: dict[str, _Accumulator],
-    ) -> None:
-        if not intent.required_capabilities:
-            return
-        for api_name in list(api_acc):
-            for operation in self.registry.list_operations(api_name):
-                capability = self.registry.capability_of(operation.operation_id)
-                if capability and _family_of(capability) in intent.required_capabilities:
-                    op_acc.setdefault(operation.operation_id, _Accumulator()).add(
-                        SelectionSource.INTENT, _SOURCE_WEIGHT[SelectionSource.INTENT]
-                    )
+            capability = getattr(
+                item,
+                "capability",
+                None,
+            ) or getattr(
+                operation,
+                "description",
+                None,
+            )
 
-    # -- ranking ---------------------------------------------------------------
-
-    def _rank_operations(
-        self, op_acc: dict[str, _Accumulator]
-    ) -> list[CandidateOperation]:
-        ranked = sorted(
-            op_acc.items(), key=lambda kv: (-kv[1].score, kv[0])
-        )[: self.max_operations]
-        operations: list[CandidateOperation] = []
-        for operation_id, acc in ranked:
-            operation = self.registry.require_operation(operation_id)
-            operations.append(
-                CandidateOperation(
+            candidates.append(
+                _RagCandidate(
                     operation_id=operation_id,
-                    api_name=operation.api_name or self.registry.api_of(operation_id),
+                    api_name=api_name,
                     operation=operation,
-                    capability=self.registry.capability_of(operation_id),
-                    score=round(acc.score, 6),
-                    sources=sorted(acc.sources),
+                    score=score,
+                    capability=capability,
                 )
             )
-        return operations
 
-    def _rank_apis(
+        # --------------------------------------------------------------
+        # Deduplicate
+        # --------------------------------------------------------------
+
+        unique: dict[str, _RagCandidate] = {}
+
+        for candidate in candidates:
+            existing = unique.get(candidate.operation_id)
+
+            if existing is None or candidate.score > existing.score:
+                unique[candidate.operation_id] = candidate
+
+        candidates = list(unique.values())
+
+        candidates.sort(
+            key=lambda candidate: candidate.score,
+            reverse=True,
+        )
+
+        return candidates[: self.max_candidates]
+
+    # ------------------------------------------------------------------
+    # Candidate filtering
+    # ------------------------------------------------------------------
+
+    def _filter_candidates(
         self,
-        api_acc: dict[str, _Accumulator],
-        operations: list[CandidateOperation],
-        rationale: str,
-    ) -> list[CandidateAPI]:
-        ops_by_api: dict[str, list[str]] = {}
-        for candidate in operations:
-            ops_by_api.setdefault(candidate.api_name, []).append(candidate.operation_id)
+        *,
+        intent: Intent,
+        candidates: list[_RagCandidate],
+    ) -> list[_RagCandidate]:
+        """Remove candidates that are obviously incompatible.
 
-        ranked = sorted(api_acc.items(), key=lambda kv: (-kv[1].score, kv[0]))
-        ranked = ranked[: self.max_apis]
-        result: list[CandidateAPI] = []
-        for name, acc in ranked:
-            api = self.registry.require_api(name)
-            result.append(
-                CandidateAPI(
-                    name=name,
-                    api=api,
-                    score=round(acc.score, 6),
-                    sources=sorted(acc.sources),
-                    operation_ids=ops_by_api.get(name, []),
-                    reason=rationale or None,
+        This is intentionally conservative.
+
+        The filter should remove obvious mismatches, not try to perform
+        the complete semantic selection. The LLM remains responsible for
+        choosing among plausible candidates.
+        """
+
+        filtered: list[_RagCandidate] = []
+
+        action = (
+            str(getattr(intent, "action", "") or "")
+            .strip()
+            .lower()
+        )
+
+        goal = (
+            str(getattr(intent, "goal", "") or "")
+            .strip()
+            .lower()
+        )
+
+        query_text = f"{goal} {action}"
+
+        for candidate in candidates:
+            operation = candidate.operation
+
+            operation_id = candidate.operation_id.lower()
+
+            description = str(
+                getattr(operation, "description", "") or ""
+            ).lower()
+
+            method = str(
+                getattr(operation, "method", "") or ""
+            ).upper()
+
+            path = str(
+                getattr(operation, "path", "") or ""
+            ).lower()
+
+            text = (
+                f"{operation_id} "
+                f"{candidate.api_name.lower()} "
+                f"{description} "
+                f"{path}"
+            )
+
+            # ----------------------------------------------------------
+            # Obvious retrieval/list intent
+            # ----------------------------------------------------------
+
+            discovery_intent = any(
+                word in query_text
+                for word in (
+                    "show",
+                    "list",
+                    "available",
+                    "discover",
+                    "retrieve",
+                    "find",
+                    "get available",
                 )
             )
-        return result
+
+            if discovery_intent:
+                # If the operation clearly requires a resource identifier
+                # and looks like a single-resource lookup, deprioritize it.
+                has_identifier_path = any(
+                    token in path
+                    for token in (
+                        "{name}",
+                        "{id}",
+                        "{sessionid}",
+                        "{assignmentid}",
+                    )
+                )
+
+                if has_identifier_path and method == "GET":
+                    continue
+
+            # ----------------------------------------------------------
+            # Obvious create/update/delete mismatch
+            # ----------------------------------------------------------
+
+            if action == "create":
+                # Keep creation operations and discovery operations that
+                # may be required before creation.
+                if method == "DELETE":
+                    continue
+
+            elif action == "delete":
+                if method != "DELETE":
+                    continue
+
+            elif action == "update":
+                if method not in ("PATCH", "PUT"):
+                    continue
+
+            elif action in ("retrieve", "check"):
+                if method == "DELETE":
+                    continue
+
+            # ----------------------------------------------------------
+            # Basic activity relevance
+            # ----------------------------------------------------------
+
+            entities = getattr(intent, "entities", []) or []
+
+            entity_values: list[str] = []
+
+            for entity in entities:
+                if hasattr(entity, "value"):
+                    value = getattr(entity, "value", None)
+                elif isinstance(entity, dict):
+                    value = entity.get("value")
+                else:
+                    value = None
+
+                if value is not None:
+                    entity_values.append(str(value).lower())
+
+            # If an entity is explicitly present and the candidate has
+            # completely unrelated content, only reject when we have a
+            # strong obvious mismatch.
+            #
+            # We deliberately do not require entity words to occur in the
+            # operation because CAMARA APIs often use technical terminology
+            # rather than the user's wording.
+            _ = entity_values
+            _ = text
+
+            filtered.append(candidate)
+
+        return filtered
+
+    # ------------------------------------------------------------------
+    # API aggregation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_api_candidates(
+        operations: list[CandidateOperation],
+    ) -> list[CandidateAPI]:
+        grouped: dict[str, CandidateAPI] = {}
+
+        for operation in operations:
+            api = grouped.get(operation.api_name)
+
+            if api is None:
+                api = CandidateAPI(
+                    name=operation.api_name,
+                    score=operation.score,
+                    sources=operation.sources.copy(),
+                    operation_ids=[operation.operation_id],
+                    reason=operation.reason,
+                )
+                grouped[operation.api_name] = api
+                continue
+
+            api.operation_ids.append(operation.operation_id)
+
+            if operation.score > api.score:
+                api.score = operation.score
+
+            for source in operation.sources:
+                if source not in api.sources:
+                    api.sources.append(source)
+
+        return sorted(
+            grouped.values(),
+            key=lambda api: api.score,
+            reverse=True,
+        )
 
 
-@lru_cache(maxsize=1)
-def get_api_selection_agent() -> APISelectionAgent:
-    """Return the process-wide API selection agent built from configured settings."""
-
-    return APISelectionAgent.from_settings()
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
 
 
-__all__ = [
-    "APISelectionAgent",
-    "APISelection",
-    "CandidateAPI",
-    "CandidateOperation",
-    "RejectedSuggestion",
-    "SelectionSource",
-    "LLMApiSelector",
-    "get_api_selection_agent",
-]
+_agent: APISelectionAgent | None = None
+
+
+def get_api_selection_agent(
+    settings: Settings | None = None,
+) -> APISelectionAgent:
+    """Return the cached API Selection Agent."""
+
+    global _agent
+
+    if _agent is None:
+        _agent = APISelectionAgent.from_settings(
+            settings=settings,
+        )
+
+    return _agent

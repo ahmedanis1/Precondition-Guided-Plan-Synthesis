@@ -10,12 +10,14 @@ from camara_pgps.retrieval.documents import (
     documents_from_api,
     documents_from_operation,
     documents_from_registry,
+    load_jsonl,
     load_markdown,
     load_text_file,
 )
 from camara_pgps.retrieval.embeddings import (
     Embedder,
     HashingEmbedder,
+    OllamaEmbedder,
     SentenceTransformerEmbedder,
     get_embedder,
 )
@@ -49,10 +51,12 @@ __all__ = [
     "documents_from_api",
     "documents_from_operation",
     "documents_from_registry",
+    "load_jsonl",
     "load_markdown",
     "load_text_file",
     "Embedder",
     "HashingEmbedder",
+    "OllamaEmbedder",
     "SentenceTransformerEmbedder",
     "get_embedder",
     "IngestionPipeline",

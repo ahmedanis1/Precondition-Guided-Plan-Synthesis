@@ -157,7 +157,16 @@ def check_structure(
         requires = set(conditions.requires) if conditions else set(step.requires)
         produces = set(conditions.produces) if conditions else set(step.produces)
 
-        unmet = requires - state
+        # A required fact only belongs to *this* (structural, inter-operation)
+        # layer when some operation in the model can actually produce it. A
+        # requirement nothing produces (a plain value like a requested
+        # duration or a profile name) was never PGPS's dependency graph to
+        # solve - it's parameter extraction's job to bind it directly onto
+        # the operation's arguments, which the payload layer (parameters.py)
+        # checks instead. Flagging it here too would report a perfectly valid
+        # chained plan as structurally broken over something this layer was
+        # never responsible for.
+        unmet = {fact for fact in requires - state if model.producers_of(fact)}
         if unmet:
             issues.append(
                 _issue(

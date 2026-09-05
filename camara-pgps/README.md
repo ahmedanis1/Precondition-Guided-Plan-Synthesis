@@ -40,6 +40,10 @@ plan is validated and executed against a CAMARA gateway (or the bundled mock).
 
 - Python 3.11+
 - [conda](https://docs.conda.io/) (Miniconda/Miniforge) for environment management
+- [Ollama](https://ollama.com/) running `qwen3:8b` for the LLM agents
+  (`ollama pull qwen3:8b`). Swap to `qwen3:14b` (or another provider) via
+  `llm.model` / `llm.provider` — no code changes. See
+  [`docs/architecture.md`](docs/architecture.md#model-selection).
 
 ## Setup
 
@@ -53,7 +57,18 @@ conda activate camara-pgps
 ```
 
 Conda provides the interpreter; every Python dependency is declared in
-`pyproject.toml` and installed via `pip -e .[dev]`.
+`pyproject.toml` and installed via `pip install -e ".[dev,llm]"`.
+
+Without conda, any Python 3.11+ virtualenv works:
+
+```bash
+python -m venv .venv && . .venv/bin/activate     # .venv\Scripts\activate on Windows
+pip install -e ".[dev,llm]"                       # preferred
+# or, deps only (no editable package):  pip install -r requirements-dev.txt
+```
+
+`requirements.txt` (runtime) and `requirements-dev.txt` (+ tooling) mirror
+`pyproject.toml`, which stays authoritative.
 
 Copy `.env.example` to `.env` and adjust as needed:
 
@@ -69,10 +84,12 @@ camara-pgps --show-config
 pytest
 ```
 
-Build the RAG knowledge base, then use the CLI or the services:
+Build the RAG knowledge base from a pre-chunked `*.jsonl` corpus
+(`retrieval.knowledge_dir`, default `data/knowledge/`), then use the CLI or the
+services:
 
 ```bash
-python -m camara_pgps ingest-camara --reset
+python -m camara_pgps ingest-camara --reset                 # or: --jsonl corpus.jsonl
 python -m camara_pgps run --request "Improve the network quality for my video call"
 python -m camara_pgps list-apis --api quality-on-demand
 python -m camara_pgps show-config
@@ -121,7 +138,8 @@ camara-pgps/
 ├── tests/               test suite
 ├── .env.example         environment-variable template
 ├── environment.yml      conda environment definition
-├── pyproject.toml       package metadata & dependencies
+├── requirements*.txt    pip mirrors of pyproject.toml (runtime / +dev)
+├── pyproject.toml       package metadata & dependencies (authoritative)
 └── docker-compose.yml   optional dev stack (mock gateway + API)
 ```
 

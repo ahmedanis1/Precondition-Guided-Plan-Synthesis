@@ -17,7 +17,8 @@ def test_package_exposes_version() -> None:
 def test_settings_load_with_defaults() -> None:
     settings = Settings()
     assert settings.environment == "development"
-    assert settings.llm.provider == "anthropic"
+    assert settings.llm.provider == "ollama"
+    assert settings.llm.model == "qwen3:8b"
     assert settings.embedding.model_name == "sentence-transformers/all-MiniLM-L6-v2"
     assert settings.vector_store.collection_name == "camara_specs"
     assert settings.mock_camara.port == 8080

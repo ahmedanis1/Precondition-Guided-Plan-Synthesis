@@ -2,7 +2,7 @@
 
     python -m camara_pgps run --request "Improve the network quality for my video call"
     python -m camara_pgps list-apis [--api quality-on-demand] [--json]
-    python -m camara_pgps ingest-camara [--reset] [--docs-dir data/camara_docs]
+    python -m camara_pgps ingest-camara [--reset] [--jsonl-dir data/knowledge] [--jsonl FILE]
     python -m camara_pgps show-config
 
 Wired to the ``camara-pgps`` console script. Heavy dependencies (LangGraph,
@@ -41,18 +41,29 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--arguments", help='JSON: {"operationId": {"param": value}}.')
     run_p.add_argument("--known-facts", help='JSON: {"fact.key": value}.')
     run_p.add_argument("--json", action="store_true", help="Print the full run as JSON.")
+    run_p.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Print each pipeline stage as it completes (intent -> rag -> "
+        "selection -> parameters -> plan -> ...) instead of only the final result.",
+    )
 
     apis_p = sub.add_parser("list-apis", help="List the registered CAMARA APIs.")
     apis_p.add_argument("--api", help="Show one API (operations, parameters, conditions).")
     apis_p.add_argument("--json", action="store_true")
 
     ingest_p = sub.add_parser(
-        "ingest-camara", help="(Re)build the RAG knowledge base in ChromaDB."
+        "ingest-camara",
+        help="Embed a pre-chunked JSONL knowledge corpus into ChromaDB.",
     )
     ingest_p.add_argument("--reset", action="store_true", help="Drop the collection first.")
-    ingest_p.add_argument("--docs-dir", help="Directory of Markdown docs to also ingest.")
     ingest_p.add_argument(
-        "--no-registry", action="store_true", help="Skip ingesting the API registry."
+        "--jsonl", action="append", default=[], metavar="PATH",
+        help="A JSONL corpus file (repeatable).",
+    )
+    ingest_p.add_argument(
+        "--jsonl-dir",
+        help="Directory of *.jsonl files (default: retrieval.knowledge_dir).",
     )
 
     sub.add_parser("show-config", help="Print the resolved configuration as JSON.")
@@ -80,14 +91,24 @@ def _cmd_run(args: argparse.Namespace) -> int:
     )
 
     workflow = get_workflow()
+    if args.verbose:
+        print(f"--- running mode={args.mode!r} request={args.request!r} ---")
     if args.mode in ("run", "plan"):
         state = getattr(workflow, args.mode)(
-            args.request, arguments=arguments, known_facts=known_facts
+            args.request,
+            arguments=arguments,
+            known_facts=known_facts,
+            verbose=args.verbose,
         )
     else:
         state = getattr(workflow, args.mode)(
-            request_text=args.request, arguments=arguments, known_facts=known_facts
+            request_text=args.request,
+            arguments=arguments,
+            known_facts=known_facts,
+            verbose=args.verbose,
         )
+    if args.verbose:
+        print("--- pipeline finished ---\n")
 
     if args.json:
         print(json.dumps(state_report(state), indent=2, default=str))
@@ -175,14 +196,13 @@ def _cmd_ingest_camara(args: argparse.Namespace) -> int:
     from camara_pgps.retrieval import run_ingestion
 
     result = run_ingestion(
-        include_registry=not args.no_registry,
-        docs_dir=args.docs_dir,
+        jsonl_paths=args.jsonl or None,
+        jsonl_dir=args.jsonl_dir,
         reset=args.reset,
     )
     print(
-        f"ingested {result.documents} document(s) -> {result.chunks} chunk(s) "
-        f"({result.written} written) into '{result.collection}' "
-        f"at {result.persist_directory}"
+        f"ingested {result.chunks} chunk(s) ({result.written} written) "
+        f"into '{result.collection}' at {result.persist_directory}"
     )
     return 0
 

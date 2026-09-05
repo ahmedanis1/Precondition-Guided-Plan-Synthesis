@@ -137,31 +137,151 @@ def test_metadata_filter_scopes_retrieval(rag: RagRetriever) -> None:
     }
 
 
-def test_unknown_operation_in_chunk_is_noted_not_raised(
-    tmp_path, registry: CamaraRegistry
+def test_operation_chunk_without_structured_payload_is_noted_not_raised(
+    tmp_path,
 ) -> None:
+    """A chunk that names an operation but carries no ``structured`` payload
+    cannot be rebuilt - it is noted and skipped, never a registry lookup."""
+
+    import json
+
+    corpus = tmp_path / "no-structured.jsonl"
+    corpus.write_text(
+        json.dumps(
+            {
+                "id": "op-nostruct",
+                "text": "createSession opens a quality on demand session.",
+                "metadata": {
+                    "api_name": "quality-on-demand",
+                    "operation_id": "createSession",
+                    "document_type": "operation",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     embedder = HashingEmbedder()
     store = VectorStore(
         persist_directory=tmp_path / "chroma",
-        collection_name="test_rag_unknown",
+        collection_name="test_rag_no_structured",
         distance="cosine",
     )
-    IngestionPipeline(vector_store=store, embedder=embedder).ingest_registry(registry)
+    IngestionPipeline(vector_store=store, embedder=embedder).ingest_jsonl([corpus])
+    rag = RagRetriever(retriever=Retriever(vector_store=store, embedder=embedder))
 
-    class ShrunkRegistry(CamaraRegistry):
-        def get_operation(self, operation_id: str):  # type: ignore[override]
-            if operation_id == "createSession":
-                return None
-            return super().get_operation(operation_id)
-
-    shrunk = ShrunkRegistry(registry.document)
-    rag = RagRetriever(
-        retriever=Retriever(vector_store=store, embedder=embedder),
-        registry=shrunk,
-    )
     ctx = rag.retrieve("create a quality on demand session")
     assert "createSession" not in ctx.operation_ids()
-    assert any("createSession" in note for note in ctx.notes)
+    assert any(
+        "createSession" in note and "no structured payload" in note
+        for note in ctx.notes
+    )
+
+
+def test_rag_builds_operation_from_jsonl_structured_payload(
+    tmp_path, registry: CamaraRegistry
+) -> None:
+    """JSONL is the source of truth: an operation absent from the registry is
+    still rebuilt from the retrieved chunk's ``structured`` payload."""
+
+    import json
+
+    corpus = tmp_path / "extra.jsonl"
+    corpus.write_text(
+        json.dumps(
+            {
+                "id": "op-x",
+                "text": "provisionEdgeNode reserves an edge compute node near the device.",
+                "metadata": {
+                    "api_name": "edge-cloud",
+                    "api_version": "2.1.0",
+                    "source": "edge-cloud.yaml",
+                    "operation_id": "provisionEdgeNode",
+                    "document_type": "operation",
+                },
+                "structured": {
+                    "operation_id": "provisionEdgeNode",
+                    "method": "POST",
+                    "path": "/edge-nodes",
+                    "summary": "Provision an edge node",
+                    "description": "Reserve an edge compute node.",
+                    "tags": ["Edge"],
+                    "deprecated": False,
+                    "parameters": [
+                        {"name": "region", "location": "query", "required": True}
+                    ],
+                    "request_body": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema_ref": "#/components/schemas/EdgeNodeRequest"
+                            }
+                        },
+                    },
+                    "responses": [
+                        {"status_code": "201", "description": "created"}
+                    ],
+                    "relationships": [
+                        {"relation": "request_body", "target": "EdgeNodeRequest"}
+                    ],
+                    "preconditions": [
+                        {"description": "authenticated", "requires": ["auth.token"]}
+                    ],
+                    "postconditions": [
+                        {"description": "edge node reserved", "produces": ["edge.node.id"]}
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    embedder = HashingEmbedder()
+    store = VectorStore(
+        persist_directory=tmp_path / "chroma",
+        collection_name="test_rag_jsonl",
+        distance="cosine",
+    )
+    IngestionPipeline(vector_store=store, embedder=embedder).ingest_jsonl([corpus])
+    rag = RagRetriever(
+        retriever=Retriever(vector_store=store, embedder=embedder),
+        registry=registry,
+    )
+    assert not registry.has_operation("provisionEdgeNode")
+
+    ctx = rag.retrieve("provision an edge compute node near my device")
+    assert "provisionEdgeNode" in ctx.operation_ids()
+    item = next(
+        i for i in ctx.operations if i.operation_id == "provisionEdgeNode"
+    )
+    # raw structure preserved verbatim for the parameter resolver
+    assert item.method == "POST"
+    assert item.path == "/edge-nodes"
+    assert item.api_name == "edge-cloud"
+    assert item.api_version == "2.1.0"
+    assert item.source == "edge-cloud.yaml"
+    assert item.description == "Reserve an edge compute node."
+    assert item.tags == ["Edge"]
+    assert item.parameters == [
+        {"name": "region", "location": "query", "required": True}
+    ]
+    assert item.request_body["content"]["application/json"]["schema_ref"] == (
+        "#/components/schemas/EdgeNodeRequest"
+    )
+    assert item.responses == [{"status_code": "201", "description": "created"}]
+    assert item.relationships == [
+        {"relation": "request_body", "target": "EdgeNodeRequest"}
+    ]
+    # typed bridge still available for PGPS / validation
+    assert item.operation.method == "POST"
+    assert item.operation.get_parameter("region") is not None
+    assert any("edge.node.id" in c.produces for c in item.operation.postconditions)
+    assert any("auth.token" in c.requires for c in item.operation.preconditions)
+    assert any(c.operation_id == "provisionEdgeNode" for c in ctx.conditions)
+
+    # the debug rendering carries operation + version + source provenance
+    rendered = ctx.as_prompt_context()
+    assert "provisionEdgeNode [edge-cloud] POST /edge-nodes" in rendered
+    assert "version 2.1.0" in rendered
+    assert "source edge-cloud.yaml" in rendered
 
 
 def test_build_queries_dedupes_and_expands(registry: CamaraRegistry) -> None:
@@ -170,13 +290,11 @@ def test_build_queries_dedupes_and_expands(registry: CamaraRegistry) -> None:
         goal="my call keeps freezing",
         action="improve_call_quality",
         constraints=["low latency required"],
-        target_domains=["quality-on-demand"],
     )
     queries = RagRetriever._build_queries(intent)
     assert queries[0] == "my call keeps freezing"
     assert "improve call quality" in queries
-    assert "low latency required" in queries
-    assert "quality-on-demand" in queries
+    assert "low latency required" in queries  # IntentConstraint.raw
     assert len(queries) == len(set(q.lower() for q in queries))
 
 

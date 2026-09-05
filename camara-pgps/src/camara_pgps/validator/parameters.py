@@ -214,8 +214,31 @@ def check_parameters(
                 for name, param in by_name.items()
                 if param.location is ParameterLocation.BODY and name in provided
             }
+            # A body property whose parameter is already resolved (a binding
+            # from an earlier step, or a default) but has no concrete value
+            # *yet* - e.g. "qosProfile", filled at execution time from a
+            # prior step's response - is not missing; it is simply not known
+            # at validation time. Re-checking "required" against the schema
+            # would otherwise re-report exactly what the REQUIRED_PARAMETER
+            # check above already correctly recognises as resolved. Only the
+            # values we actually have get checked for real conformance.
+            deferred = {
+                name
+                for name, param in by_name.items()
+                if param.location is ParameterLocation.BODY
+                and name in will_have
+                and name not in provided
+            }
+            schema = operation.request_schema
+            if deferred and isinstance(schema.get("required"), list):
+                schema = {
+                    **schema,
+                    "required": [
+                        name for name in schema["required"] if name not in deferred
+                    ],
+                }
             if body:
-                _check_payload_schema(operation.request_schema, body, step, issues)
+                _check_payload_schema(schema, body, step, issues)
 
     return issues
 

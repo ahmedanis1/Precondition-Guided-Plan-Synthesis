@@ -83,6 +83,8 @@ class MockExecutor(APIExecutor):
         args = request.json_body or {}
         session_id = _stable_id(operation.operation_id, str(step.index), "session")
         subscription_id = _stable_id(operation.operation_id, str(step.index), "subscription")
+        assignment_id = _stable_id(operation.operation_id, str(step.index), "assignment")
+        geofencing_id = _stable_id(operation.operation_id, str(step.index), "geofencing")
 
         builders: dict[str, Callable[[], tuple[int, Any]]] = {
             "createSession": lambda: (
@@ -99,6 +101,67 @@ class MockExecutor(APIExecutor):
                 {"sessionId": self._path_id(request) or session_id, "qosStatus": "AVAILABLE"},
             ),
             "deleteSession": lambda: (204, None),
+            "extendQosSessionDuration": lambda: (
+                200,
+                {"sessionId": self._path_id(request) or session_id, "qosStatus": "AVAILABLE"},
+            ),
+            # Two sessions on purpose (not one) - this is the operation PGPS
+            # chains in front of extendQosSessionDuration when sessionId isn't
+            # already known, and a single-item list would never exercise the
+            # ItemSelectionAgent's job of picking the one that actually
+            # matches the user's request (e.g. "my *gaming* session").
+            "retrieveSessionsByDevice": lambda: (
+                200,
+                [
+                    {
+                        "sessionId": _stable_id(operation.operation_id, str(step.index), "session", "gaming"),
+                        "qosStatus": "AVAILABLE",
+                        "qosProfile": "QOS_L",
+                        "duration": 3600,
+                        "applicationServer": {"ipv4Address": "203.0.113.10"},
+                        "description": "Low-latency profile typically used for real-time gaming",
+                    },
+                    {
+                        "sessionId": _stable_id(operation.operation_id, str(step.index), "session", "streaming"),
+                        "qosStatus": "AVAILABLE",
+                        "qosProfile": "QOS_S",
+                        "duration": 7200,
+                        "applicationServer": {"ipv4Address": "203.0.113.20"},
+                        "description": "Standard profile typically used for media streaming",
+                    },
+                ],
+            ),
+            # Three profiles on purpose, with genuinely different priority/
+            # quality characteristics - this is the operation PGPS chains in
+            # front of createSession when qosProfile isn't already known, and
+            # a single-item list would never exercise the ItemSelectionAgent's
+            # job of picking the one that actually matches the user's request
+            # (e.g. "ensure best quality for an interview" should favour the
+            # lowest packetDelayBudget / highest priority profile, not just
+            # whichever one happens to be listed first).
+            "retrieveQoSProfiles": lambda: (
+                200,
+                [
+                    {
+                        "name": "QOS_L",
+                        "description": "Low-latency profile for real-time, interactive use (video calls, gaming)",
+                        "status": "ACTIVE",
+                        "priority": 1,
+                    },
+                    {
+                        "name": "QOS_M",
+                        "description": "Balanced profile for general browsing and messaging",
+                        "status": "ACTIVE",
+                        "priority": 50,
+                    },
+                    {
+                        "name": "QOS_S",
+                        "description": "Standard profile typically used for media streaming",
+                        "status": "ACTIVE",
+                        "priority": 80,
+                    },
+                ],
+            ),
             "verifyLocation": lambda: (
                 200,
                 {"verificationResult": "TRUE", "matchRate": 100},
@@ -110,6 +173,39 @@ class MockExecutor(APIExecutor):
                     "area": {"areaType": "CIRCLE", "center": {"latitude": 0, "longitude": 0}},
                 },
             ),
+            "createQosAssignment": lambda: (
+                201,
+                {
+                    "assignmentId": assignment_id,
+                    "status": "AVAILABLE",
+                    "qosProfile": args.get("qosProfile"),
+                    "device": args.get("device"),
+                },
+            ),
+            "getQosAssignmentById": lambda: (
+                200,
+                {"assignmentId": self._path_id(request) or assignment_id, "status": "AVAILABLE"},
+            ),
+            "getQosAssignmentByDevice": lambda: (
+                200,
+                [{"assignmentId": assignment_id, "status": "AVAILABLE"}],
+            ),
+            "revokeQosAssignment": lambda: (204, None),
+            "createGeofencingSubscription": lambda: (
+                201,
+                {
+                    "id": geofencing_id,
+                    "status": "ACTIVE",
+                    "protocol": args.get("protocol"),
+                    "sink": args.get("sink"),
+                    "types": args.get("types"),
+                },
+            ),
+            "retrieveGeofencingSubscription": lambda: (
+                200,
+                {"id": self._path_id(request) or geofencing_id, "status": "ACTIVE"},
+            ),
+            "deleteGeofencingSubscription": lambda: (204, None),
             "createInsightsSubscription": lambda: (201, {"subscriptionId": subscription_id}),
             "getInsightsSubscription": lambda: (
                 200,
