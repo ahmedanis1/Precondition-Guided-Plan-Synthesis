@@ -9,6 +9,7 @@ turns a natural-language question into a
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from functools import lru_cache
 from pathlib import Path
@@ -73,10 +74,18 @@ class VectorStore:
             return 0
         if len(chunks) != len(embeddings):
             raise ValueError("chunks and embeddings must be the same length")
+        metadatas: list[dict[str, Any]] = []
+        for chunk in chunks:
+            flat = chunk.metadata.to_chroma()
+            if chunk.structured is not None:
+                # ChromaDB metadata is scalar-only; carry the structured payload
+                # as a compact JSON string so RAG can rebuild the operation.
+                flat["structured"] = json.dumps(chunk.structured, separators=(",", ":"))
+            metadatas.append(flat)
         self._collection.upsert(
             ids=[chunk.id for chunk in chunks],
             documents=[chunk.text for chunk in chunks],
-            metadatas=cast("Any", [chunk.metadata.to_chroma() for chunk in chunks]),
+            metadatas=cast("Any", metadatas),
             embeddings=cast("Any", [[float(v) for v in vector] for vector in embeddings]),
         )
         return len(chunks)

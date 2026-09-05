@@ -1,12 +1,13 @@
 """Embedding backends for the ingestion / retrieval pipeline.
 
-Two implementations:
+Implementations (selected by ``embedding.provider``):
 
-* :class:`SentenceTransformerEmbedder` - the real backend, wrapping
-  ``sentence-transformers`` (imported lazily so the dependency is only needed
-  when it is actually used).
-* :class:`HashingEmbedder` - a deterministic, dependency-free hashing embedder
-  for offline runs and tests. Selected with ``embedding.provider = "hash"``.
+* :class:`SentenceTransformerEmbedder` (``sentence-transformers``) - a local model,
+  imported lazily.
+* :class:`OllamaEmbedder` (``ollama``) - calls an Ollama server's embedding
+  endpoint over HTTP.
+* :class:`HashingEmbedder` (``hash``) - a deterministic, dependency-free hashing
+  embedder for offline runs and tests.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import hashlib
 import math
 import re
 from collections.abc import Sequence
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from camara_pgps.config import Settings, get_settings
 
@@ -113,6 +114,73 @@ class SentenceTransformerEmbedder:
         return [float(value) for value in vector.tolist()]
 
 
+class OllamaEmbedder:
+    """Embeddings from an Ollama server (``POST {base_url}/api/embed``).
+
+    ``model_name`` is the Ollama model tag, e.g. ``nomic-embed-text`` or
+    ``mxbai-embed-large``. Vectors are L2-normalised so cosine and dot-product
+    distances agree, matching the other backends.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "nomic-embed-text",
+        *,
+        base_url: str = "http://localhost:11434",
+        batch_size: int = 32,
+        timeout: float = 60.0,
+        client: Any | None = None,
+    ) -> None:
+        self.model_name = model_name
+        self.batch_size = batch_size
+        self.dimension = 0  # set after the first successful call
+        self._base_url = base_url.rstrip("/")
+        self._timeout = timeout
+        self._client = client
+        self._owns_client = client is None
+
+    def _http(self) -> Any:
+        if self._client is None:
+            import httpx
+
+            self._client = httpx.Client(timeout=self._timeout)
+        return self._client
+
+    def _request(self, texts: list[str]) -> list[list[float]]:
+        response = self._http().post(
+            f"{self._base_url}/api/embed",
+            json={"model": self.model_name, "input": texts},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        raw = payload.get("embeddings")
+        if raw is None and "embedding" in payload:  # legacy /api/embeddings shape
+            raw = [payload["embedding"]]
+        if not raw:
+            raise ValueError(f"Ollama returned no embeddings for model {self.model_name!r}")
+        vectors = [_normalise([float(value) for value in vector]) for vector in raw]
+        if not self.dimension:
+            self.dimension = len(vectors[0])
+        return vectors
+
+    def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+        items = list(texts)
+        if not items:
+            return []
+        out: list[list[float]] = []
+        for start in range(0, len(items), self.batch_size):
+            out.extend(self._request(items[start : start + self.batch_size]))
+        return out
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._request([text])[0]
+
+    def close(self) -> None:
+        if self._client is not None and self._owns_client:
+            self._client.close()
+            self._client = None
+
+
 def get_embedder(settings: Settings | None = None) -> Embedder:
     """Build the embedder selected by ``settings.embedding``."""
 
@@ -120,6 +188,12 @@ def get_embedder(settings: Settings | None = None) -> Embedder:
     provider = settings.embedding.provider.lower()
     if provider in {"hash", "hashing"}:
         return HashingEmbedder()
+    if provider in {"ollama"}:
+        return OllamaEmbedder(
+            settings.embedding.model_name,
+            base_url=settings.embedding.base_url,
+            batch_size=settings.embedding.batch_size,
+        )
     if provider in {"sentence-transformers", "sentence_transformers", "st"}:
         return SentenceTransformerEmbedder(
             settings.embedding.model_name,

@@ -142,37 +142,20 @@ def test_selection_is_a_shortlist_not_a_plan(
     assert scores == sorted(scores, reverse=True)
 
 
-def test_capability_families_expand_to_apis_without_rag(
+def test_no_rag_no_llm_yields_no_candidates(
     registry: CamaraRegistry, rag: RagRetriever
 ) -> None:
+    # candidates come from RAG (or the LLM) only - the intent no longer names APIs
     agent = APISelectionAgent(registry=registry, rag=rag)
     empty_rag = RagContext(
         query="x", documentation=RetrievalResult(query="x", chunks=[])
     )
     selection = agent.select(
-        Intent(text="improve streaming", goal="improve streaming",
-               required_capabilities=["qos"]),
+        Intent(text="improve streaming", goal="improve streaming"),
         rag_context=empty_rag,
     )
-    assert "quality-on-demand" in selection.api_names()
-    assert "createSession" in selection.operation_ids()
-
-
-def test_unknown_domain_from_intent_is_rejected(
-    registry: CamaraRegistry, rag: RagRetriever
-) -> None:
-    agent = APISelectionAgent(registry=registry, rag=rag)
-    empty_rag = RagContext(
-        query="x", documentation=RetrievalResult(query="x", chunks=[])
-    )
-    selection = agent.select(
-        Intent(text="do a thing", goal="do a thing", target_domains=["made-up-api"]),
-        rag_context=empty_rag,
-    )
-    rejected = {r.name: r for r in selection.rejected}
-    assert "made-up-api" in rejected
-    assert rejected["made-up-api"].source == SelectionSource.INTENT
-    assert "made-up-api" not in selection.api_names()
+    assert selection.api_names() == []
+    assert selection.operations == []
 
 
 def test_accepts_raw_text(registry: CamaraRegistry, rag: RagRetriever) -> None:

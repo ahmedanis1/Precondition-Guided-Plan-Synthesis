@@ -80,6 +80,16 @@ class Condition(BaseModel):
     requires: list[str] = Field(default_factory=list)
     produces: list[str] = Field(default_factory=list)
     source: str | None = None
+    produces_from: dict[str, str] = Field(default_factory=dict)
+    """Optional ``{fact_key: response_body_field}`` map for postconditions.
+
+    Declares, generically and per-operation, which field of the operation's
+    JSON response body supplies the value for each produced fact (e.g.
+    ``{"qos.session.id": "sessionId"}``). This is what lets the execution
+    layer read a real value out of any operation's response without a
+    hand-maintained Python table per API - see ``execution/executor.py``.
+    Only meaningful on postconditions; always empty on preconditions.
+    """
 
 
 class CamaraOperation(BaseModel):

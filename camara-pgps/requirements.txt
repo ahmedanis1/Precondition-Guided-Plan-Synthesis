@@ -1,0 +1,36 @@
+# Runtime dependencies.
+#
+# pyproject.toml is the single source of truth; this file mirrors its
+# [project.dependencies] for tools/workflows that expect a requirements file.
+# Preferred install for development:  pip install -e ".[dev,llm]"
+
+# Data modelling & configuration
+pydantic>=2.6,<3
+pydantic-settings>=2.2,<3
+python-dotenv>=1.0
+PyYAML>=6.0
+
+# LLM orchestration
+langchain>=0.3,<0.4
+langchain-core>=0.3,<0.4
+langchain-community>=0.3,<0.4
+langgraph>=0.2,<0.4
+
+# HTTP / API surface
+fastapi>=0.110
+uvicorn[standard]>=0.29
+httpx>=0.27
+
+# Retrieval augmented generation
+chromadb>=0.5
+sentence-transformers>=3.0
+
+# Knowledge graph
+networkx>=3.3
+
+# Plan / payload validation
+jsonschema>=4.20
+
+# Model Context Protocol
+mcp>=1.0
+langchain-mcp-adapters>=0.1

@@ -178,6 +178,22 @@ class OperationConditions(BaseModel):
     def produces(self) -> set[str]:
         return {fact for c in self.postconditions for fact in c.produces}
 
+    @property
+    def produces_from(self) -> dict[str, str]:
+        """``{fact_key: response_body_field}`` merged across all postconditions.
+
+        Purely declarative - sourced from ``data/conditions/*.conditions.json``
+        (via ``Postcondition.produces_from``), never hardcoded per operation in
+        Python. Empty when a fact has no known response field (e.g. it is a
+        synthetic "we now know this happened" marker), in which case the
+        executor falls back to recording ``True`` for that fact.
+        """
+
+        mapping: dict[str, str] = {}
+        for condition in self.postconditions:
+            mapping.update(condition.produces_from)
+        return mapping
+
     def _known(self, state: FactSet | Iterable[str]) -> FactSet:
         return state if isinstance(state, FactSet) else FactSet(state)
 

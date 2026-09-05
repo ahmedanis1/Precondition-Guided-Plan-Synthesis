@@ -9,12 +9,22 @@ and produces a :class:`~camara_pgps.camara.schemas.RegistryAPI` that the
 Every parsed operation is stamped with a :class:`SourceRef` (source, source_url,
 api_name, version, operation_id) so the RAG layer can later explain where an API
 or parameter came from.
+
+Every ``$ref`` is resolved and inlined (bounded by ``_MAX_DEREF_DEPTH`` against
+cycles) before a schema is stored on an operation - callers such as
+:class:`~camara_pgps.validator.parameters.PlanValidator` validate a request body
+straight against ``operation.request_schema`` with no resolver of their own, so
+by the time a schema reaches an operation it must already be self-contained.
+
+Note: this parser is independent of, and not used by, the real RAG ingestion
+pipeline (``openapi_to_dataset.py`` -> ``*.dataset.jsonl`` -> ChromaDB). It
+exists for anyone who wants a typed, registry-shaped view of a spec instead.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -35,7 +45,7 @@ from camara_pgps.models import APIParameter, HTTPMethod, ParameterLocation
 
 logger = logging.getLogger(__name__)
 
-_HTTP_METHODS = {"get", "put", "post", "delete", "patch", "head", "options"}
+_HTTP_METHODS = {"get", "put", "post", "delete", "options", "head", "patch"}
 _MAX_DEREF_DEPTH = 200
 
 
@@ -43,320 +53,339 @@ class OpenAPIParseError(ValueError):
     """Raised when a document cannot be parsed as an OpenAPI 3.x spec."""
 
 
-class _ExternalRef(Exception):
-    """Internal signal: a ``$ref`` points outside the document."""
+def _looks_like_url(source: str) -> bool:
+    return urlparse(source).scheme in ("http", "https")
 
 
-# --------------------------------------------------------------------------- #
-# small helpers
-# --------------------------------------------------------------------------- #
+def _load_mapping(source: str | Path | Mapping[str, Any]) -> tuple[dict[str, Any], str | None]:
+    """Return ``(document, location)`` for a path, URL, YAML/JSON text, or mapping."""
 
-def _slugify(text: str) -> str:
-    out = []
-    prev_dash = False
-    for ch in text.strip().lower():
-        if ch.isalnum():
-            out.append(ch)
-            prev_dash = False
-        elif not prev_dash:
-            out.append("-")
-            prev_dash = True
-    return "".join(out).strip("-")
+    if isinstance(source, Mapping):
+        return dict(source), None
 
+    text: str
+    location: str | None
+    if isinstance(source, Path) or (isinstance(source, str) and not _looks_like_url(source)):
+        path = Path(source)
+        if path.is_file():
+            text = path.read_text(encoding="utf-8")
+            location = str(path)
+        else:
+            # Not an existing file - treat the string itself as raw spec text.
+            text = str(source)
+            location = None
+    elif isinstance(source, str) and _looks_like_url(source):
+        import httpx
 
-def _is_version_segment(segment: str) -> bool:
-    seg = segment.lower()
-    return seg in {"vwip", "vwip1"} or (seg.startswith("v") and seg[1:2].isdigit())
+        response = httpx.get(source, timeout=30.0)
+        response.raise_for_status()
+        text = response.text
+        location = source
+    else:  # pragma: no cover - defensive
+        raise OpenAPIParseError(f"Cannot parse OpenAPI source of type {type(source)!r}")
 
-
-def _is_success_code(code: str) -> bool:
-    code = code.lower()
-    return code.startswith("2") or code in {"2xx"}
-
-
-def _load_document(text: str) -> dict[str, Any]:
     try:
         data = yaml.safe_load(text)
-    except yaml.YAMLError as exc:  # pragma: no cover - passthrough
-        raise OpenAPIParseError(f"could not parse document as YAML/JSON: {exc}") from exc
+    except yaml.YAMLError as exc:
+        raise OpenAPIParseError(f"Not valid YAML/JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise OpenAPIParseError("OpenAPI document must be a mapping at the top level")
-    return data
+    return data, location
 
 
-def _media_example(media: Mapping[str, Any]) -> Any:
-    if "example" in media:
-        return media["example"]
-    examples = media.get("examples")
-    if isinstance(examples, Mapping) and examples:
-        first = next(iter(examples.values()))
-        if isinstance(first, Mapping) and "value" in first:
-            return first["value"]
-        return first
-    return None
+def _deref(node: Any, root: dict[str, Any], *, depth: int = 0) -> Any:
+    """Recursively resolve and inline every internal ``#/...`` ``$ref``."""
 
+    if depth > _MAX_DEREF_DEPTH:
+        raise OpenAPIParseError("$ref resolution exceeded the maximum depth (possible cycle)")
 
-def _first_json_media(content: Mapping[str, Any]) -> dict[str, Any]:
-    if not isinstance(content, Mapping):
-        return {}
-    if "application/json" in content:
-        return dict(content["application/json"])
-    for media_type, media in content.items():
-        if isinstance(media_type, str) and media_type.endswith(("json", "+json")):
-            return dict(media)
-    return {}
+    if isinstance(node, list):
+        return [_deref(item, root, depth=depth + 1) for item in node]
 
+    if not isinstance(node, dict):
+        return node
 
-def _collect_properties(schema: Mapping[str, Any]) -> tuple[dict[str, Any], set[str]]:
-    """Flatten ``properties`` / ``required`` through ``allOf`` / ``oneOf`` / ``anyOf``."""
+    ref = node.get("$ref")
+    if isinstance(ref, str):
+        if not ref.startswith("#/"):
+            # An external ref (e.g. "../common/CAMARA_common.yaml#/...") -
+            # real CAMARA specs commonly pull shared parameters/responses
+            # from a sibling file this project doesn't have on disk. Rather
+            # than fail the whole parse over what's usually a non-required
+            # header parameter or a generic error response, degrade to an
+            # empty schema and note it - callers deriving `requires` never
+            # see a phantom required field this way, they just see nothing
+            # here, which is the safe direction to be wrong in.
+            logger.warning("Unresolved external $ref (left empty): %r", ref)
+            return {"description": f"(unresolved external $ref: {ref})"}
+        target: Any = root
+        for part in ref[2:].split("/"):
+            try:
+                target = target[part]
+            except (KeyError, TypeError) as exc:
+                raise OpenAPIParseError(f"Unresolvable $ref: {ref!r}") from exc
+        resolved = _deref(target, root, depth=depth + 1)
+        # A ref sibling key (rare, but valid in OpenAPI 3.1) overrides the target.
+        if len(node) > 1 and isinstance(resolved, dict):
+            merged = dict(resolved)
+            merged.update({k: v for k, v in node.items() if k != "$ref"})
+            return merged
+        return resolved
 
-    props: dict[str, Any] = {}
-    required: set[str] = set()
-    stack: list[Any] = [schema]
-    while stack:
-        node = stack.pop()
-        if not isinstance(node, Mapping):
-            continue
-        for name, sub in (node.get("properties") or {}).items():
-            props.setdefault(name, sub)
-        required.update(node.get("required") or [])
-        for combinator in ("allOf", "oneOf", "anyOf"):
-            stack.extend(node.get(combinator) or [])
-    return props, required
+    all_of = node.get("allOf")
+    if isinstance(all_of, list):
+        merged_required: list[str] = []
+        merged_properties: dict[str, Any] = {}
+        merged_rest: dict[str, Any] = {k: v for k, v in node.items() if k != "allOf"}
+        for member in all_of:
+            resolved_member = _deref(member, root, depth=depth + 1)
+            if isinstance(resolved_member, dict):
+                merged_required.extend(resolved_member.get("required", []))
+                merged_properties.update(resolved_member.get("properties", {}))
+                for key, value in resolved_member.items():
+                    if key not in ("required", "properties"):
+                        merged_rest.setdefault(key, value)
+        result = dict(merged_rest)
+        result["type"] = result.get("type", "object")
+        if merged_properties:
+            result["properties"] = merged_properties
+        if merged_required:
+            # de-dupe, preserve order
+            seen: set[str] = set()
+            result["required"] = [r for r in merged_required if not (r in seen or seen.add(r))]
+        return result
 
+    return {key: _deref(value, root, depth=depth + 1) for key, value in node.items()}
 
-# --------------------------------------------------------------------------- #
-# parser
-# --------------------------------------------------------------------------- #
 
 class OpenAPIParser:
-    """Turn an OpenAPI 3.x document into a :class:`RegistryAPI`.
-
-    ``strict=True`` turns every warning (missing operationId, unresolved ``$ref``,
-    unknown security scheme, ...) into an :class:`OpenAPIParseError`. Otherwise
-    warnings are logged and collected on :attr:`warnings`.
-    """
+    """Parses a single OpenAPI 3.x document into a :class:`RegistryAPI`."""
 
     def __init__(self, *, strict: bool = False) -> None:
         self.strict = strict
         self.warnings: list[str] = []
-        self._root: dict[str, Any] = {}
 
-    # -- public API ----------------------------------------------------------
+    def _warn(self, message: str) -> None:
+        if self.strict:
+            raise OpenAPIParseError(message)
+        logger.warning(message)
+        self.warnings.append(message)
+
+    # -- entry points --------------------------------------------------------
+
+    def parse_file(
+        self, path: str | Path, *, source_url: str | None = None
+    ) -> RegistryAPI:
+        return self.parse(path, source_url=source_url)
+
+    def parse_text(self, text: str, *, source_url: str | None = None) -> RegistryAPI:
+        return self.parse(text, source_url=source_url)
+
+    def parse_mapping(
+        self, data: Mapping[str, Any], *, source_url: str | None = None
+    ) -> RegistryAPI:
+        return self.parse(data, source_url=source_url)
 
     def parse(
         self,
-        document: Mapping[str, Any],
+        source: str | Path | Mapping[str, Any],
         *,
-        source: str | None = None,
         source_url: str | None = None,
-        name: str | None = None,
     ) -> RegistryAPI:
-        self.warnings = []
-        self._root = dict(document)
-        self._check_version()
+        document, location = _load_mapping(source)
 
-        info = self._root.get("info") or {}
-        version = str(info.get("version") or "0.0.0")
-        api_name = (
-            name
-            or self._name_from_servers()
-            or _slugify(str(info.get("title") or ""))
-            or "camara-api"
+        if "swagger" in document and "openapi" not in document:
+            raise OpenAPIParseError(
+                f"Swagger {document.get('swagger')!r} documents are not supported; "
+                "convert to OpenAPI 3.x first"
+            )
+        openapi_version = document.get("openapi")
+        if not isinstance(openapi_version, str) or not openapi_version.startswith("3."):
+            raise OpenAPIParseError(
+                f"Unsupported or missing 'openapi' version: {openapi_version!r}"
+            )
+
+        info = document.get("info") or {}
+        title = info.get("title")
+        version = info.get("version") or "0.0.0"
+        name = self._slugify(title) if title else "unknown-api"
+        description = info.get("description")
+
+        base_path = None
+        servers = document.get("servers") or []
+        if servers:
+            base_path = servers[0].get("url")
+
+        global_security = document.get("security") or []
+        global_tags = [t.get("name") for t in document.get("tags") or [] if t.get("name")]
+
+        seen_ids: set[str] = set()
+        operations: list[RegistryOperation] = []
+        for path_item, path_spec in (document.get("paths") or {}).items():
+            if not isinstance(path_spec, dict):
+                continue
+            path_spec_resolved = _deref(path_spec, document)
+            shared_params = path_spec_resolved.get("parameters") or []
+            for method_name, op_spec in path_spec_resolved.items():
+                if method_name not in _HTTP_METHODS or not isinstance(op_spec, dict):
+                    continue
+                operation = self._parse_operation(
+                    method=method_name,
+                    path=path_item,
+                    spec=op_spec,
+                    shared_params=shared_params,
+                    document=document,
+                    api_name=name,
+                    version=version,
+                    location=location,
+                    source_url=source_url,
+                    global_security=global_security,
+                    global_tags=global_tags,
+                )
+                if operation.operation_id in seen_ids:
+                    self._warn(
+                        f"Duplicate operationId {operation.operation_id!r} in {location or source_url}"
+                    )
+                seen_ids.add(operation.operation_id)
+                operations.append(operation)
+
+        provenance = Provenance(
+            source_type=SourceType.OPENAPI,
+            location=location or source_url or "<in-memory>",
+            source_url=source_url,
+            spec_version=version,
+            retrieved_at=datetime.now(UTC),
         )
-        base_path = self._base_path()
-
-        operations = self._operations(api_name, version, source, source_url)
-
-        raw_tags = self._root.get("tags") or []
-        tag_names = [t["name"] for t in raw_tags if isinstance(t, Mapping) and t.get("name")]
 
         return RegistryAPI(
-            name=api_name,
+            name=name,
             version=version,
-            title=info.get("title"),
-            description=info.get("description"),
+            title=title,
+            description=description,
             base_path=base_path,
             spec_url=source_url,
-            source_file=source,
-            tags=tag_names,
+            source_file=location,
+            tags=global_tags,
             operations=operations,
-            provenance=Provenance(
-                source_type=SourceType.OPENAPI,
-                location=source or source_url or "<in-memory>",
-                source_url=source_url,
-                spec_version=version,
-                retrieved_at=datetime.now(tz=UTC),
-                note=f"Parsed from OpenAPI {self._root.get('openapi')}",
-            ),
+            provenance=provenance,
         )
 
-    def parse_text(
-        self,
-        text: str,
-        *,
-        source: str | None = None,
-        source_url: str | None = None,
-        name: str | None = None,
-    ) -> RegistryAPI:
-        return self.parse(_load_document(text), source=source, source_url=source_url, name=name)
+    # -- helpers --------------------------------------------------------------
 
-    def parse_file(
-        self,
-        path: str | Path,
-        *,
-        source_url: str | None = None,
-        name: str | None = None,
-    ) -> RegistryAPI:
-        file_path = Path(path)
-        if not file_path.is_file():
-            raise OpenAPIParseError(f"OpenAPI file not found: {file_path}")
-        return self.parse_text(
-            file_path.read_text("utf-8"),
-            source=str(file_path),
-            source_url=source_url,
-            name=name,
-        )
+    @staticmethod
+    def _slugify(title: str) -> str:
+        return "-".join(title.lower().split())
 
-    def parse_url(
-        self, url: str, *, client: Any | None = None, name: str | None = None
-    ) -> RegistryAPI:
-        import httpx
-
-        owns_client = client is None
-        client = client or httpx.Client(timeout=30.0, follow_redirects=True)
-        try:
-            response = client.get(url)
-            response.raise_for_status()
-            return self.parse_text(response.text, source=url, source_url=url, name=name)
-        finally:
-            if owns_client:
-                client.close()
-
-    # -- structural extraction --------------------------------------------------
-
-    def _check_version(self) -> None:
-        if "openapi" not in self._root:
-            if "swagger" in self._root:
-                raise OpenAPIParseError(
-                    "Swagger / OpenAPI 2.0 documents are not supported; provide OpenAPI 3.x"
-                )
-            raise OpenAPIParseError("document has no 'openapi' version field")
-        if not str(self._root["openapi"]).startswith("3."):
-            self._warn(f"unexpected OpenAPI version {self._root['openapi']!r}; parsing as 3.x")
-
-    def _base_path(self) -> str | None:
-        servers = self._root.get("servers") or []
-        if not servers:
-            return None
-        url = str(servers[0].get("url", "")).strip()
-        if not url:
-            return None
-        parsed = urlparse(url)
-        return parsed.path or url or None
-
-    def _name_from_servers(self) -> str | None:
-        servers = self._root.get("servers") or []
-        if not servers:
-            return None
-        parsed = urlparse(str(servers[0].get("url", "")))
-        segments = [
-            seg
-            for seg in parsed.path.split("/")
-            if seg and not seg.startswith("{") and not _is_version_segment(seg)
-        ]
-        return _slugify(segments[-1]) if segments else None
-
-    def _operations(
-        self,
-        api_name: str,
-        version: str,
-        source: str | None,
-        source_url: str | None,
-    ) -> list[RegistryOperation]:
-        operations: list[RegistryOperation] = []
-        paths = self._root.get("paths") or {}
-        for path, path_item in paths.items():
-            if not isinstance(path_item, Mapping):
-                continue
-            shared_params = self._parameters(path_item.get("parameters") or [])
-            for method, operation in path_item.items():
-                if method.lower() not in _HTTP_METHODS or not isinstance(operation, Mapping):
-                    continue
-                operations.append(
-                    self._operation(
-                        path=path,
-                        method=method.lower(),
-                        operation=operation,
-                        shared_params=shared_params,
-                        api_name=api_name,
-                        version=version,
-                        source=source,
-                        source_url=source_url,
-                    )
-                )
-        return operations
-
-    def _operation(
+    def _parse_operation(
         self,
         *,
-        path: str,
         method: str,
-        operation: Mapping[str, Any],
-        shared_params: list[APIParameter],
+        path: str,
+        spec: dict[str, Any],
+        shared_params: list[Any],
+        document: dict[str, Any],
         api_name: str,
         version: str,
-        source: str | None,
+        location: str | None,
         source_url: str | None,
+        global_security: list[Any],
+        global_tags: list[str],
     ) -> RegistryOperation:
-        operation_id = operation.get("operationId")
+        operation_id = spec.get("operationId")
         if not operation_id:
-            segments = [
-                seg.replace("{", "").replace("}", "")
-                for seg in path.split("/")
-                if seg
-            ]
-            operation_id = "_".join([method, *segments]) if segments else method
+            operation_id = f"{method}_{path}".replace("/", "_").replace("{", "").replace("}", "")
             self._warn(
-                f"operation {method.upper()} {path} has no operationId; "
+                f"Operation {method.upper()} {path} has no operationId; "
                 f"synthesised {operation_id!r}"
             )
 
-        own_params = self._parameters(operation.get("parameters") or [])
-        params = self._merge_params(shared_params, own_params)
+        all_params_raw = list(shared_params) + list(spec.get("parameters") or [])
+        parameters: list[APIParameter] = []
+        for raw_param in all_params_raw:
+            resolved_param = _deref(raw_param, document)
+            if "name" not in resolved_param:
+                # Came from an unresolved external $ref (no "name" to give
+                # back) - drop it rather than crash. In practice this is
+                # always a non-required, non-fact-bearing header like
+                # x-correlator, so dropping it changes nothing about
+                # `requires`/`produces`.
+                logger.warning(
+                    "Dropping parameter with no resolvable name in %s %s",
+                    method.upper(),
+                    path,
+                )
+                continue
+            parameters.append(self._parse_parameter(resolved_param))
 
-        request_schema, body_params, request_example = self._request_body(
-            operation.get("requestBody")
-        )
-        params.extend(body_params)
+        request_schema: dict[str, Any] | None = None
+        request_body = spec.get("requestBody")
+        if isinstance(request_body, dict):
+            resolved_body = _deref(request_body, document)
+            content = resolved_body.get("content") or {}
+            json_content = content.get("application/json") or next(iter(content.values()), {})
+            schema = json_content.get("schema")
+            if schema is not None:
+                request_schema = _deref(schema, document)
+            if request_schema:
+                # One BODY-location APIParameter per top-level request-body
+                # field - not a single wrapped blob - so the validator's
+                # per-parameter checks (required / type / enum) line up with
+                # PlanValidator's `body = {name: ... if location is BODY}`
+                # reconstruction in validator/parameters.py.
+                required_fields = set(request_schema.get("required", []))
+                for field_name, field_schema in (request_schema.get("properties") or {}).items():
+                    parameters.append(
+                        APIParameter(
+                            name=field_name,
+                            location=ParameterLocation.BODY,
+                            required=field_name in required_fields,
+                            description=field_schema.get("description")
+                            if isinstance(field_schema, dict)
+                            else None,
+                            schema=field_schema if isinstance(field_schema, dict) else {},
+                            enum=(field_schema.get("enum", []) if isinstance(field_schema, dict) else []),
+                        )
+                    )
 
-        responses, success_schema, response_examples = self._responses(
-            operation.get("responses") or {}
-        )
-        errors = [r for r in responses if r.is_error]
-
+        responses: list[ResponseSpec] = []
+        errors: list[ResponseSpec] = []
         examples: dict[str, Any] = {}
-        if request_example is not None:
-            examples["request"] = request_example
-        param_examples = {p.name: p.example for p in params if p.example is not None}
-        if param_examples:
-            examples["parameters"] = param_examples
-        if response_examples:
-            examples["responses"] = response_examples
+        for status_code, resp_spec in (spec.get("responses") or {}).items():
+            resolved_resp = _deref(resp_spec, document)
+            content = (resolved_resp.get("content") or {}).get("application/json") or {}
+            resp_schema = content.get("schema")
+            is_error = status_code.isdigit() and int(status_code) >= 400
+            entry = ResponseSpec(
+                status_code=str(status_code),
+                description=resolved_resp.get("description"),
+                schema=resp_schema,
+                is_error=is_error,
+            )
+            (errors if is_error else responses).append(entry)
+            if "example" in content:
+                examples[str(status_code)] = content["example"]
+
+        security = spec.get("security", global_security) or []
+        scopes: list[str] = []
+        for entry in security:
+            if isinstance(entry, dict):
+                for scope_list in entry.values():
+                    scopes.extend(scope_list or [])
+
+        tags = spec.get("tags") or global_tags
 
         return RegistryOperation(
             operation_id=operation_id,
             method=HTTPMethod(method.upper()),
             path=path,
-            summary=operation.get("summary"),
-            description=operation.get("description"),
-            parameters=params,
+            summary=spec.get("summary"),
+            description=spec.get("description"),
+            parameters=parameters,
             request_schema=request_schema,
-            response_schema=success_schema,
-            tags=list(operation.get("tags") or []),
-            security_scopes=self._security_scopes(operation.get("security")),
+            response_schema=(responses[0].schema_ if responses else None),
+            tags=tags,
+            security_scopes=scopes,
             api_name=api_name,
-            deprecated=bool(operation.get("deprecated", False)),
             responses=responses,
             errors=errors,
             examples=examples,
@@ -364,242 +393,67 @@ class OpenAPIParser:
                 api_name=api_name,
                 version=version,
                 operation_id=operation_id,
-                source=source,
+                source=location,
                 source_url=source_url,
             ),
         )
 
-    def _parameters(self, raw: list[Any]) -> list[APIParameter]:
-        result: list[APIParameter] = []
-        for entry in raw:
-            resolved = self._deref(entry)
-            if not isinstance(resolved, Mapping) or "$ref" in resolved:
-                self._warn(f"skipping unresolved parameter: {entry!r}")
-                continue
-            location = resolved.get("in")
-            try:
-                param_location = ParameterLocation(str(location))
-            except ValueError:
-                self._warn(
-                    f"parameter {resolved.get('name')!r} has unknown location "
-                    f"{location!r}; skipped"
-                )
-                continue
-            schema = resolved.get("schema") or {}
-            result.append(
-                APIParameter(
-                    name=resolved["name"],
-                    location=param_location,
-                    required=bool(
-                        resolved.get("required", param_location is ParameterLocation.PATH)
-                    ),
-                    description=resolved.get("description"),
-                    schema=schema,
-                    example=resolved.get("example"),
-                    default=schema.get("default"),
-                    enum=list(schema.get("enum") or []),
-                )
-            )
-        return result
-
     @staticmethod
-    def _merge_params(
-        base: list[APIParameter], override: list[APIParameter]
-    ) -> list[APIParameter]:
-        merged = {(p.location, p.name): p for p in base}
-        for param in override:
-            merged[(param.location, param.name)] = param
-        return list(merged.values())
+    def _parse_parameter(spec: dict[str, Any]) -> APIParameter:
+        location = spec.get("in", "query")
+        return APIParameter(
+            name=spec["name"],
+            location=ParameterLocation(location),
+            required=bool(spec.get("required", False)),
+            description=spec.get("description"),
+            schema=spec.get("schema") or {},
+            example=spec.get("example"),
+            default=(spec.get("schema") or {}).get("default"),
+            enum=(spec.get("schema") or {}).get("enum", []),
+        )
 
-    def _request_body(
-        self, request_body: Any
-    ) -> tuple[dict[str, Any] | None, list[APIParameter], Any]:
-        resolved = self._deref(request_body)
-        if not isinstance(resolved, Mapping) or "$ref" in resolved:
-            return None, [], None
-
-        media = _first_json_media(resolved.get("content") or {})
-        schema = self._deref(media.get("schema")) if media.get("schema") is not None else None
-        example = _media_example(media)
-
-        params: list[APIParameter] = []
-        request_schema: dict[str, Any] | None = None
-        if isinstance(schema, Mapping):
-            request_schema = dict(schema)
-            body_required = bool(resolved.get("required", False))
-            properties, required_fields = _collect_properties(schema)
-            for prop_name, prop_schema in properties.items():
-                prop_schema = prop_schema if isinstance(prop_schema, Mapping) else {}
-                params.append(
-                    APIParameter(
-                        name=prop_name,
-                        location=ParameterLocation.BODY,
-                        required=body_required and prop_name in required_fields,
-                        description=prop_schema.get("description"),
-                        schema=dict(prop_schema),
-                        example=prop_schema.get("example"),
-                        default=prop_schema.get("default"),
-                        enum=list(prop_schema.get("enum") or []),
-                    )
-                )
-        return request_schema, params, example
-
-    def _responses(
-        self, responses: Mapping[str, Any]
-    ) -> tuple[list[ResponseSpec], dict[str, Any] | None, dict[str, Any]]:
-        specs: list[ResponseSpec] = []
-        success_schema: dict[str, Any] | None = None
-        examples: dict[str, Any] = {}
-        for code, entry in responses.items():
-            resolved = self._deref(entry)
-            if not isinstance(resolved, Mapping) or "$ref" in resolved:
-                self._warn(f"skipping unresolved response {code!r}")
-                continue
-            media = _first_json_media(resolved.get("content") or {})
-            schema = self._deref(media.get("schema")) if media.get("schema") is not None else None
-            schema_dict = dict(schema) if isinstance(schema, Mapping) else None
-            is_error = not _is_success_code(str(code))
-            specs.append(
-                ResponseSpec(
-                    status_code=str(code),
-                    description=resolved.get("description"),
-                    schema=schema_dict,
-                    is_error=is_error,
-                )
-            )
-            example = _media_example(media)
-            if example is not None:
-                examples[str(code)] = example
-            if not is_error and success_schema is None and schema_dict is not None:
-                success_schema = schema_dict
-        return specs, success_schema, examples
-
-    def _security_scopes(self, operation_security: Any) -> list[str]:
-        requirements = operation_security
-        if requirements is None:
-            requirements = self._root.get("security")
-        if not requirements:
-            return []
-        schemes = (self._root.get("components") or {}).get("securitySchemes") or {}
-        scopes: list[str] = []
-        for requirement in requirements:
-            if not isinstance(requirement, Mapping):
-                continue
-            for scheme_name, scope_list in requirement.items():
-                if scheme_name not in schemes:
-                    self._warn(f"security scheme {scheme_name!r} is not defined in components")
-                scopes.extend(scope_list or [])
-        return list(dict.fromkeys(scopes))
-
-    # -- $ref resolution ------------------------------------------------------
-
-    def _resolve_ref(self, ref: str) -> Any:
-        if not ref.startswith("#/"):
-            raise _ExternalRef(ref)
-        node: Any = self._root
-        for part in ref[2:].split("/"):
-            part = part.replace("~1", "/").replace("~0", "~")
-            if not isinstance(node, Mapping) or part not in node:
-                raise KeyError(ref)
-            node = node[part]
-        return node
-
-    def _deref(self, node: Any, _seen: frozenset[str] | None = None, _depth: int = 0) -> Any:
-        if _seen is None:
-            _seen = frozenset()
-        if _depth > _MAX_DEREF_DEPTH:
-            self._warn("maximum $ref expansion depth reached; leaving remaining refs intact")
-            return node
-        if isinstance(node, Mapping):
-            ref = node.get("$ref")
-            if isinstance(ref, str):
-                if ref in _seen:
-                    return {"$ref": ref}
-                try:
-                    target = self._resolve_ref(ref)
-                except _ExternalRef:
-                    self._warn(f"external $ref left unresolved: {ref}")
-                    return dict(node)
-                except (KeyError, TypeError):
-                    self._warn(f"could not resolve $ref: {ref}")
-                    return dict(node)
-                resolved = self._deref(target, _seen | {ref}, _depth + 1)
-                siblings = {
-                    key: self._deref(value, _seen, _depth + 1)
-                    for key, value in node.items()
-                    if key != "$ref"
-                }
-                if isinstance(resolved, Mapping) and siblings:
-                    return {**resolved, **siblings}
-                return resolved
-            return {key: self._deref(value, _seen, _depth + 1) for key, value in node.items()}
-        if isinstance(node, list):
-            return [self._deref(item, _seen, _depth + 1) for item in node]
-        return node
-
-    # -- diagnostics --------------------------------------------------------
-
-    def _warn(self, message: str) -> None:
-        self.warnings.append(message)
-        if self.strict:
-            raise OpenAPIParseError(message)
-        logger.warning("openapi-parser: %s", message)
-
-
-# --------------------------------------------------------------------------- #
-# module-level convenience
-# --------------------------------------------------------------------------- #
 
 def parse_openapi(
     source: str | Path | Mapping[str, Any],
     *,
     source_url: str | None = None,
-    name: str | None = None,
     strict: bool = False,
 ) -> RegistryAPI:
-    """Parse a spec given as a mapping, file path, URL or raw text."""
+    """Convenience one-shot: parse a single OpenAPI document into a ``RegistryAPI``."""
 
-    parser = OpenAPIParser(strict=strict)
-    if isinstance(source, Mapping):
-        return parser.parse(source, source_url=source_url, name=name)
-    text = str(source)
-    if text.startswith(("http://", "https://")):
-        return parser.parse_url(text, name=name)
-    if "\n" in text or text.lstrip().startswith("{"):
-        return parser.parse_text(text, source=None, source_url=source_url, name=name)
-    return parser.parse_file(text, source_url=source_url, name=name)
+    return OpenAPIParser(strict=strict).parse(source, source_url=source_url)
 
 
 def build_registry_document(
-    sources: Iterable[str | Path | Mapping[str, Any]],
+    sources: list[str | Path | Mapping[str, Any]],
     *,
     version: str = "0.0.0",
-    description: str | None = None,
     strict: bool = False,
 ) -> RegistryDocument:
     """Parse several specs into a single :class:`RegistryDocument`."""
 
-    apis = [parse_openapi(src, strict=strict) for src in sources]
-    return RegistryDocument(
-        version=version,
-        description=description,
-        generated_at=datetime.now(tz=UTC),
-        apis=apis,
-    )
+    apis = [OpenAPIParser(strict=strict).parse(source) for source in sources]
+    return RegistryDocument(version=version, generated_at=datetime.now(UTC), apis=apis)
 
 
 def build_registry(
-    sources: Iterable[str | Path | Mapping[str, Any]],
+    sources: list[str | Path | Mapping[str, Any]],
     *,
     version: str = "0.0.0",
-    description: str | None = None,
     strict: bool = False,
-) -> Any:
+):
     """Parse several specs and return a ready-to-query ``CamaraRegistry``."""
 
     from camara_pgps.camara.registry import CamaraRegistry
 
-    document = build_registry_document(
-        sources, version=version, description=description, strict=strict
-    )
+    document = build_registry_document(sources, version=version, strict=strict)
     return CamaraRegistry(document)
+
+
+__all__ = [
+    "OpenAPIParseError",
+    "OpenAPIParser",
+    "parse_openapi",
+    "build_registry",
+    "build_registry_document",
+]

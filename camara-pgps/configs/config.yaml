@@ -9,26 +9,32 @@ debug: false
 log_level: INFO
 
 llm:
-  provider: anthropic
-  model: claude-sonnet-5
+  provider: ollama            # ollama | anthropic | openai | none
+  model: qwen3:8b             # change to qwen3:14b to compare models
+  base_url: http://localhost:11434
   temperature: 0.0
 
 embedding:
-  provider: sentence-transformers
+  provider: sentence-transformers   # sentence-transformers | ollama | hash
   model_name: sentence-transformers/all-MiniLM-L6-v2
   device: cpu
   batch_size: 32
+  base_url: http://localhost:11434  # Ollama server (provider = ollama)
 
 vector_store:
   persist_directory: data/chroma
   collection_name: camara_specs
   distance: cosine
 
+retrieval:
+  knowledge_dir: data/knowledge   # directory of pre-chunked *.jsonl corpus files
+
 graph:
   path: data/knowledge_graph.gml
 
 registry:
-  path: data/registry/camara_apis.json
+  path: data/registry/camara_apis.json   # legacy milestone-3 fixture, no longer read by default
+  specs_dir: data/camara_docs            # real OpenAPI specs the live registry is built from
 
 camara:
   base_url: http://localhost:8080

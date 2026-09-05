@@ -1,104 +1,110 @@
 # Adding a new CAMARA API
 
-The registry file `data/registry/camara_apis.json` is the **authoritative source
-of executable APIs**. Nothing else in the system hard-codes API names, so adding
-an API is a data change plus (optionally) re-ingesting the knowledge base.
+RAG (selection) and PGPS (planning) are two independent tracks that share
+only the `operation_id` string. Neither reads the other's data, and neither
+touches `CamaraRegistry` / `data/registry/camara_apis.json` — that registry
+is separate, older milestone-3 scaffolding still used elsewhere in the
+codebase (parameter extraction, execution, validation, the API/CLI layers),
+but it plays no part in how a new API becomes selectable or plannable.
 
-## 1. Add the API to the registry
+## Track 1 — make it selectable (RAG)
 
-Append an entry to `apis` in `data/registry/camara_apis.json`:
+1. Add the raw OpenAPI spec for the new API under `data/camara_docs/<api-name>.yaml`.
+2. Run your `openapi_to_dataset.py` extraction script against it to produce
+   `data/camara_docs/<api-name>.dataset.jsonl` - facts only (method, path,
+   parameters, tags, security scopes), by design no invented semantics at
+   this stage. Spot-check a couple of `operation_id` values against the raw
+   spec's `operationId` field: they must match byte-for-byte, since this
+   string is copied verbatim through every layer below and never
+   regenerated.
+3. Ingest it:
+   ```bash
+   python -m camara_pgps ingest-camara --jsonl-dir data/camara_docs --reset
+   ```
+4. Done - API Selection can now surface the new API's operations. Nothing
+   about `CamaraRegistry` or `data/registry/camara_apis.json` is involved;
+   it never was for the four real APIs already in the system.
 
-```jsonc
-{
-  "name": "sim-swap",                       // lowercase slug, unique
-  "title": "SIM Swap",
-  "version": "2.0.0",
-  "description": "Check whether a SIM card has been swapped recently.",
-  "base_path": "/sim-swap/v2",
-  "tags": ["fraud"],
-  "provenance": {
-    "source_type": "local_registry",
-    "location": "data/registry/camara_apis.json",
-    "spec_version": "2.0.0",
-    "note": "Hand-authored."
-  },
-  "operations": [
-    {
-      "operation_id": "checkSimSwap",       // unique across the whole registry
-      "method": "POST",
-      "path": "/check",
-      "summary": "Check for a recent SIM swap.",
-      "capability": "sim-swap.check",        // dotted slug: <family>.<action>
-      "api_name": "sim-swap",
-      "security_scopes": ["sim-swap:check"],
-      "parameters": [
-        { "name": "phoneNumber", "location": "body", "required": true,
-          "schema": {"type": "string"} },
-        { "name": "maxAge", "location": "body", "required": false,
-          "schema": {"type": "integer"}, "enum": [240, 1440] }
-      ],
-      "preconditions": [
-        { "kind": "precondition", "description": "An access token is available.",
-          "requires": ["auth.token"], "source": "manual" },
-        { "kind": "precondition", "description": "The device identifier is known.",
-          "requires": ["device.identifier"], "source": "manual" }
-      ],
-      "postconditions": [
-        { "kind": "postcondition", "description": "The swap check result is known.",
-          "produces": ["sim-swap.result"], "source": "manual" }
-      ]
-    }
-  ]
-}
-```
+## Track 2 — make it plannable (PGPS)
 
-### Field notes
-
-* **`capability`** — a dotted slug validated by `CapabilityMapper`
-  (`^[a-z0-9-]+(\.[a-z0-9-]+)+$`). The part before the first `.` is the
-  *capability family*; the intent agent selects at family granularity.
-* **`requires` / `produces`** — [fact keys](#fact-key-conventions). Reuse an
-  existing key when two operations refer to the same thing — that is what creates
-  a dependency edge in the PGPS graph.
-* **`enum`** on a parameter is enforced by the validator and surfaced by the
-  repair agent.
-
-### From an OpenAPI document instead
-
-```python
-from camara_pgps.camara import parse_openapi
-api = parse_openapi("path/or/https/url/to/spec.yaml")
-```
-
-`parse_openapi` fills everything except `preconditions` / `postconditions` /
-`capability` (OpenAPI has no standard for them) — add those by hand afterwards,
-following the recipe in the [README](../README.md#making-a-condition-from-an-api)
-or the table above.
-
-## 2. Re-ingest the knowledge base
+`scripts/generate_conditions.py` automates everything mechanical in this
+track and refuses to guess at anything that isn't:
 
 ```bash
-python -m camara_pgps ingest-camara --reset
+python scripts/generate_conditions.py data/camara_docs/<api-name>.yaml
 ```
 
-## 3. (Optional) add intent keywords
+It parses the raw spec (`$ref`s resolved, `allOf` merged - the same parser
+verified against all four real APIs), cross-checks every `operation_id`
+against the matching `.dataset.jsonl` (catches typos immediately - a wrong
+key would otherwise fail silently by just never matching, rather than
+raising), and writes
+`data/conditions/<api-name>.conditions.draft.json` with, per operation:
+
+- `requires`: every required path/query parameter, every required
+  request-body field, plus `auth.token` if the operation declares a
+  security scope - raw field names, mechanically complete and correct by
+  construction (a required field is a required field), but NOT yet renamed
+  into this project's dotted fact-key convention (e.g. `sessionId` should
+  usually become `qos.session.id`, not stay `sessionId`) - that renaming is
+  what makes two operations agree they're describing the same fact, and is
+  a judgment call about this project's vocabulary, not something the spec
+  states.
+- `produces`: left empty, plus a `_produces_candidates_from_response_schema`
+  list of the success response's own top-level field names as a memory-jog.
+  Deciding what an operation's postconditions actually are - does calling
+  it establish a fact (usually an id) that another operation will need
+  later? - is the one thing an OpenAPI spec genuinely cannot answer; a
+  response schema describes what comes back, not what the API's lifecycle
+  promises about it. Pure reads/checks legitimately produce nothing - that's
+  fine, `PGPSPlanner._plan_direct` handles operations with no postconditions
+  to chain instead of treating them as infeasible.
+
+The output is deliberately named `.conditions.draft.json`, not
+`.conditions.json` - `PGPSPlanner` only loads the latter, so a draft can
+never accidentally go live. Review it, rename/trim the facts, delete the
+`_requires_raw_from_spec` / `_produces_candidates_from_response_schema`
+scratch keys, then rename the file to drop `.draft` to promote it.
+
+Afterwards (or any time later, to re-check something already promoted):
+
+```bash
+python scripts/generate_conditions.py --check <api-name>
+```
+
+validates the live `data/conditions/<api-name>.conditions.json`: every key
+still matches a real `operation_id` in the `.dataset.jsonl`, and no
+`operation_id` repeats across any file in `data/conditions/`.
+
+`PGPSPlanner()` (no arguments) automatically picks up every
+`*.conditions.json` file under `data/conditions/` via
+`pgps/conditions_loader.py` - it never touches `CamaraRegistry` or the RAG
+corpus to do so.
+
+## Trustworthiness, in one line
+
+`requires` is mechanical and inherits the spec's own trustworthiness;
+`produces` is a human judgment call about the API's lifecycle semantics and
+should get an explicit review pass (by you, or a second reader) before
+being relied on - the `Condition.source` field exists precisely to record
+which is which (`"schema"` vs `"manual"`) if you want that provenance
+queryable later rather than only living in your head.
+
+## (Optional, separate from the above) intent keyword hints
 
 The offline rule-based intent parser matches capability families using
-`registry.capabilities()` plus operation summaries/tags. If you want the
-*offline* path to route a new family well, add a keyword set to
-`agents/intent_agent._FAMILY_SYNONYMS` (the LLM path does not need this).
+`registry.capabilities()` plus operation summaries/tags - this is the one
+place the old registry is still consulted, and it's unrelated to whether
+RAG can select or PGPS can plan the new API. If you want the *offline*
+intent path (not the LLM path, which doesn't need this) to route a new
+family well, add a keyword set to `agents/intent_agent._FAMILY_SYNONYMS`.
 
-## 4. Verify
+## Verify
 
 ```bash
-python -m camara_pgps list-apis --api sim-swap
-pytest -q                       # registry/graph/solver tests validate the new data
-python -m camara_pgps run --request "has my SIM been swapped?" \
-  --arguments '{"checkSimSwap": {"phoneNumber": "+12025550123"}}'
+pytest -q                                  # existing tests should pass unchanged
+python -m camara_pgps run --request "..."  # exercise the new API end-to-end once wired
 ```
-
-`pytest` will fail loudly if an `operation_id` collides, a `capability` slug is
-malformed, or a `requires` fact has no producer and is not an external fact.
 
 ## Fact-key conventions
 
@@ -108,8 +114,7 @@ Dotted `domain.resource.attribute`. Currently in use:
 |---|---|
 | `auth.token` | an OAuth2 access token is available (seeded by the workflow) |
 | `device.identifier` / `device.phoneNumber` | the target device is identified |
-| `location.area` | an area to check against is known |
-| `qos.profile` | a QoS profile name has been chosen |
-| `qos.session.id` / `qos.session` / `qos.session.deleted` | QoD session lifecycle |
-| `device.location` / `device.location.verification` | location retrieval / verification results |
-| `network-insights.subscription.id` / `network-insights.subscription` | NI subscription lifecycle |
+| `qos.profile.name` | a QoS profile name has been chosen |
+| `qos.assignment.id` / `qos.assignment` | QoS Provisioning assignment lifecycle |
+| `qos.session.id` / `qos.session` | Quality on Demand session lifecycle |
+| `qos.session.application_server` / `qos.session.duration` / `qos.session.additional_duration` | session parameters supplied at creation/extension |

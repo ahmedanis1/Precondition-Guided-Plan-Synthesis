@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import pytest
+from conftest import stub_intent_agent
 from fastapi.testclient import TestClient
 
+from camara_pgps.agents import RepairAgent
 from camara_pgps.api.main import app, workflow_dependency
 from camara_pgps.camara.registry import CamaraRegistry
 from camara_pgps.config import PROJECT_ROOT
@@ -43,7 +45,11 @@ def client(tmp_path) -> TestClient:
     )
     workflow = CamaraWorkflow(
         nodes=WorkflowNodes(
-            registry=registry, rag_retriever=rag, executor=MockExecutor(registry=registry)
+            registry=registry,
+            rag_retriever=rag,
+            executor=MockExecutor(registry=registry),
+            intent_agent=stub_intent_agent(),
+            repair_agent=RepairAgent(registry=registry),
         )
     )
     app.dependency_overrides[workflow_dependency] = lambda: workflow

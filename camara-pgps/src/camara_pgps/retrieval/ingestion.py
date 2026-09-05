@@ -1,42 +1,40 @@
-"""The CAMARA knowledge ingestion pipeline.
+"""CAMARA knowledge ingestion pipeline.
 
-    CAMARA documentation
-        -> document loading / parsing   (retrieval.documents)
-        -> chunking                     (retrieval.documents.chunk_documents)
-        -> metadata extraction          (ChunkMetadata on every chunk)
-        -> embeddings                   (retrieval.embeddings)
-        -> ChromaDB                     (retrieval.retriever.VectorStore)
+    pre-chunked CAMARA JSONL
+        -> load JSONL records          (retrieval.documents.load_jsonl)
+        -> embed each record's text    (retrieval.embeddings)
+        -> store in ChromaDB           (retrieval.retriever.VectorStore)
 
-:class:`IngestionPipeline` wires those stages together. The metadata carried into
-ChromaDB for every chunk is ``api_name, version, operation_id, source,
-document_type, section``.
+The JSONL corpus is already semantically chunked, so its records are embedded
+directly. Each record: ``{"id", "text", "metadata", "structured"}`` (``id`` and
+``structured`` optional).
+
+``IngestionPipeline`` also exposes the generic ``ingest_chunks`` / ``ingest_documents``
+primitives and an ``ingest_registry`` convenience (used by tests and anyone who
+wants to embed the API registry instead of / alongside a JSONL corpus).
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 
 from pydantic import BaseModel
 
-from camara_pgps.camara.openapi_parser import parse_openapi
 from camara_pgps.camara.registry import CamaraRegistry
-from camara_pgps.camara.schemas import RegistryAPI
 from camara_pgps.config import Settings, get_settings
 from camara_pgps.retrieval.documents import (
+    Chunk,
     Document,
     chunk_documents,
-    documents_from_api,
     documents_from_registry,
-    load_markdown,
+    load_jsonl,
 )
 from camara_pgps.retrieval.embeddings import Embedder, get_embedder
 from camara_pgps.retrieval.retriever import VectorStore
 
 logger = logging.getLogger(__name__)
-
-_MARKDOWN_SUFFIXES = {".md", ".markdown"}
 
 
 class IngestionResult(BaseModel):
@@ -59,7 +57,7 @@ class IngestionResult(BaseModel):
 
 
 class IngestionPipeline:
-    """Load -> parse -> chunk -> embed -> store CAMARA knowledge."""
+    """Load -> embed -> store CAMARA knowledge (JSONL corpus, or documents)."""
 
     def __init__(
         self,
@@ -76,64 +74,79 @@ class IngestionPipeline:
         self.max_chars = max_chars
         self.overlap = overlap
 
-    # -- stages -----------------------------------------------------------------
-
-    def ingest_documents(self, documents: Iterable[Document]) -> IngestionResult:
-        documents = list(documents)
-        chunks = chunk_documents(
-            documents, max_chars=self.max_chars, overlap=self.overlap
+    def _empty(self) -> IngestionResult:
+        return IngestionResult(
+            collection=self.vector_store.collection_name,
+            persist_directory=self.vector_store.persist_directory,
         )
-        written = 0
-        if chunks:
-            vectors = self.embedder.embed_documents([chunk.text for chunk in chunks])
-            written = self.vector_store.add(chunks, vectors)
+
+    # -- generic primitives --------------------------------------------------
+
+    def ingest_chunks(self, chunks: Sequence[Chunk]) -> IngestionResult:
+        """Embed and store ready-made chunks. Every other path funnels here."""
+
+        chunks = list(chunks)
+        if not chunks:
+            return self._empty()
+        vectors = self.embedder.embed_documents([chunk.text for chunk in chunks])
+        written = self.vector_store.add(chunks, vectors)
         logger.info(
-            "ingested %d document(s) -> %d chunk(s) into %s",
-            len(documents),
+            "ingested %d chunk(s) -> %d vector(s) into %s",
             len(chunks),
+            written,
             self.vector_store.collection_name,
         )
         return IngestionResult(
-            documents=len(documents),
+            documents=len(chunks),
             chunks=len(chunks),
             written=written,
             collection=self.vector_store.collection_name,
             persist_directory=self.vector_store.persist_directory,
         )
 
-    # -- sources --------------------------------------------------------------
+    def ingest_documents(self, documents: Iterable[Document]) -> IngestionResult:
+        """Chunk unstructured documents, then embed and store them."""
 
-    def ingest_registry(self, registry: CamaraRegistry | None = None) -> IngestionResult:
-        registry = registry or CamaraRegistry.from_settings(self.settings)
-        return self.ingest_documents(documents_from_registry(registry))
+        documents = list(documents)
+        chunks = chunk_documents(
+            documents, max_chars=self.max_chars, overlap=self.overlap
+        )
+        result = self.ingest_chunks(chunks)
+        return result.model_copy(update={"documents": len(documents)})
 
-    def ingest_api(self, api: RegistryAPI) -> IngestionResult:
-        return self.ingest_documents(documents_from_api(api))
+    # -- JSONL corpus (the primary path) --------------------------------------
 
-    def ingest_openapi(
-        self,
-        specs: Iterable[str | Path],
-        *,
-        source_url: str | None = None,
-    ) -> IngestionResult:
-        documents: list[Document] = []
-        for spec in specs:
-            api = parse_openapi(spec, source_url=source_url)
-            documents.extend(documents_from_api(api))
-        return self.ingest_documents(documents)
+    def ingest_jsonl(self, paths: Iterable[str | Path]) -> IngestionResult:
+        """Ingest pre-chunked JSONL records directly (no re-chunking)."""
 
-    def ingest_markdown(self, paths: Iterable[str | Path]) -> IngestionResult:
-        documents: list[Document] = []
+        chunks: list[Chunk] = []
+        seen: set[str] = set()
         for path in paths:
-            documents.extend(load_markdown(Path(path)))
-        return self.ingest_documents(documents)
+            loaded = load_jsonl(path)
+            for chunk in loaded:
+                if chunk.id in seen:
+                    continue
+                seen.add(chunk.id)
+                chunks.append(chunk)
+            logger.info("loaded %d record(s) from %s", len(loaded), path)
+        return self.ingest_chunks(chunks)
 
     def ingest_directory(self, directory: str | Path) -> IngestionResult:
-        root = Path(directory)
-        markdown_files = sorted(
-            p for p in root.rglob("*") if p.suffix.lower() in _MARKDOWN_SUFFIXES
-        )
-        return self.ingest_markdown(markdown_files)
+        """Ingest every ``*.jsonl`` file found under ``directory`` (recursively)."""
+
+        files = sorted(Path(directory).rglob("*.jsonl"))
+        logger.info("found %d JSONL file(s) in %s", len(files), directory)
+        return self.ingest_jsonl(files)
+
+    # -- convenience -----------------------------------------------------------
+
+    def ingest_registry(
+        self, registry: CamaraRegistry | None = None
+    ) -> IngestionResult:
+        """Render the CAMARA registry to documents and ingest them."""
+
+        registry = registry or CamaraRegistry.from_settings(self.settings)
+        return self.ingest_documents(documents_from_registry(registry))
 
     def reset(self) -> None:
         self.vector_store.reset()
@@ -142,25 +155,36 @@ class IngestionPipeline:
 def run_ingestion(
     *,
     settings: Settings | None = None,
-    include_registry: bool = True,
-    docs_dir: str | Path | None = None,
+    jsonl_paths: Iterable[str | Path] | None = None,
+    jsonl_dir: str | Path | None = None,
     reset: bool = False,
 ) -> IngestionResult:
-    """Convenience entry point: ingest the local registry and an optional docs dir."""
+    """Embed a pre-chunked JSONL corpus into ChromaDB.
+
+    Uses ``jsonl_paths`` and/or ``jsonl_dir``; when neither is given it falls
+    back to ``settings.retrieval.knowledge_dir`` if that directory exists.
+    """
 
     settings = settings or get_settings()
     pipeline = IngestionPipeline(settings=settings)
     if reset:
         pipeline.reset()
 
-    result = IngestionResult(
-        collection=pipeline.vector_store.collection_name,
-        persist_directory=pipeline.vector_store.persist_directory,
-    )
-    if include_registry:
-        result = result.merge(pipeline.ingest_registry())
-    if docs_dir is not None:
-        result = result.merge(pipeline.ingest_directory(docs_dir))
+    result = pipeline._empty()
+
+    paths = list(jsonl_paths or [])
+    if paths:
+        result = result.merge(pipeline.ingest_jsonl(paths))
+
+    directory = jsonl_dir if jsonl_dir is not None else settings.retrieval.knowledge_dir
+    if directory is not None and Path(directory).is_dir():
+        result = result.merge(pipeline.ingest_directory(directory))
+    elif not paths:
+        logger.warning(
+            "no JSONL corpus to ingest (jsonl_paths empty, %s not a directory)",
+            directory,
+        )
+
     return result
 
 

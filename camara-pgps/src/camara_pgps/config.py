@@ -30,25 +30,45 @@ DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "config.yaml"
 
 
 class LLMSettings(BaseModel):
-    """Large-language-model provider configuration."""
+    """Chat-model configuration for the LLM agents.
 
-    provider: str = "anthropic"
-    model: str = "claude-sonnet-5"
+    ``provider``: ``ollama`` (default, local) | ``anthropic`` | ``openai`` |
+    ``none`` (no LLM). The model is chosen here, never in agent code - change
+    ``model`` (e.g. ``qwen3:8b`` -> ``qwen3:14b``) to compare models.
+    """
+
+    provider: str = "ollama"
+    model: str = "qwen3:8b"
+    base_url: str = "http://localhost:11434"  # used when provider = "ollama"
     api_key: str | None = None
     temperature: float = 0.0
+    timeout: float = 300.0
+    """Read timeout (seconds) for a single chat call. Was previously hardcoded
+    to 120s inside OllamaChatModel and ignored for the ollama provider."""
+    keep_alive: str | int | None = "30m"
+    """Ollama-only: how long to keep the model resident after a call
+    (e.g. "30m", -1 to never unload, 0 to unload immediately). Ignored by
+    the anthropic/openai providers."""
+    max_retries: int = 1
+    """Automatic retries on a timeout/connection error before giving up."""
 
 
 class EmbeddingSettings(BaseModel):
     """Embedding backend configuration.
 
-    ``provider`` selects the implementation: ``sentence-transformers`` (default)
-    or ``hash`` (a deterministic, dependency-free embedder for offline use / tests).
+    ``provider`` selects the implementation:
+
+    * ``sentence-transformers`` (default) - a local model
+    * ``ollama`` - an Ollama server; ``model_name`` is the Ollama model tag
+      (e.g. ``nomic-embed-text``) and ``base_url`` points at the server
+    * ``hash`` - a deterministic, dependency-free embedder for offline use / tests
     """
 
     provider: str = "sentence-transformers"
     model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     device: str = "cpu"
     batch_size: int = 32
+    base_url: str = "http://localhost:11434"  # used when provider = "ollama"
 
 
 class VectorStoreSettings(BaseModel):
@@ -59,6 +79,16 @@ class VectorStoreSettings(BaseModel):
     distance: str = "cosine"
 
 
+class RetrievalSettings(BaseModel):
+    """RAG knowledge base configuration.
+
+    ``knowledge_dir`` is a directory of pre-chunked ``*.jsonl`` corpus files that
+    ``run_ingestion`` embeds into ChromaDB.
+    """
+
+    knowledge_dir: Path = Path("data/camara_docs")
+
+
 class GraphSettings(BaseModel):
     """Knowledge-graph persistence configuration."""
 
@@ -66,9 +96,31 @@ class GraphSettings(BaseModel):
 
 
 class RegistrySettings(BaseModel):
-    """Local CAMARA API registry (authoritative source of executable APIs)."""
+    """Local CAMARA API registry (authoritative source of executable APIs).
+
+    ``CamaraRegistry.from_settings()`` builds the live registry straight from
+    the real CAMARA OpenAPI specs in ``specs_dir`` - there is no separate
+    hand-maintained JSON file to keep in sync as APIs are added. ``path`` is
+    kept only because ``CamaraRegistry.from_file()`` still loads the old
+    milestone-3 fixture explicitly in tests/test_registry.py; it is no
+    longer read by ``from_settings()``.
+    """
 
     path: Path = Path("data/registry/camara_apis.json")
+    specs_dir: Path = Path("data/camara_docs")
+
+
+class ConditionsSettings(BaseModel):
+    """PGPS precondition/postcondition data.
+
+    Deliberately decoupled from :class:`RegistrySettings`: RAG / API
+    Selection never load this, and PGPS never loads the registry. Each file
+    under ``directory`` is named ``<api-name>.conditions.json`` and keyed by
+    ``operation_id`` (verbatim from the OpenAPI ``operationId``, matching the
+    ids RAG hands back in ``PlanRequest.candidate_operations``).
+    """
+
+    directory: Path = Path("data/conditions")
 
 
 class CamaraSettings(BaseModel):
@@ -128,8 +180,10 @@ class Settings(BaseSettings):
     llm: LLMSettings = Field(default_factory=LLMSettings)
     embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     vector_store: VectorStoreSettings = Field(default_factory=VectorStoreSettings)
+    retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
     graph: GraphSettings = Field(default_factory=GraphSettings)
     registry: RegistrySettings = Field(default_factory=RegistrySettings)
+    conditions: ConditionsSettings = Field(default_factory=ConditionsSettings)
     camara: CamaraSettings = Field(default_factory=CamaraSettings)
     execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
     mock_camara: MockCamaraSettings = Field(default_factory=MockCamaraSettings)

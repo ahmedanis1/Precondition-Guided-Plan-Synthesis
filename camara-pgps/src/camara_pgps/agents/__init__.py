@@ -1,12 +1,15 @@
 """LLM agents. Each agent has a single, bounded responsibility.
 
 * :mod:`camara_pgps.agents.intent_agent` - natural language -> structured Intent.
-* :mod:`camara_pgps.agents.api_selection_agent` - Intent (+ RAG) -> registry-verified
+* :mod:`camara_pgps.agents.api_selection_agent` - query + intent + RAG ->
   candidate APIs / operations.
 * :mod:`camara_pgps.agents.parameter_agent` - request + candidate operations ->
   grounded parameter bindings (+ missing_information).
 * :mod:`camara_pgps.agents.repair_agent` - missing_information -> one
   natural-language clarification question (never fills in values).
+* :mod:`camara_pgps.agents.item_selection_agent` - a list of candidate items
+  (e.g. every session returned by a discovery operation) + the user's
+  request -> the index of the one item that matches.
 """
 
 from camara_pgps.agents.api_selection_agent import (
@@ -15,16 +18,18 @@ from camara_pgps.agents.api_selection_agent import (
     CandidateAPI,
     CandidateOperation,
     LLMApiSelector,
-    RejectedSuggestion,
     SelectionSource,
     get_api_selection_agent,
+)
+from camara_pgps.agents.item_selection_agent import (
+    ItemSelection,
+    ItemSelectionAgent,
 )
 from camara_pgps.agents.intent_agent import (
     IntentAgent,
     IntentDraft,
     IntentParser,
     LLMIntentParser,
-    RuleBasedIntentParser,
     get_intent_agent,
 )
 from camara_pgps.agents.parameter_agent import (
@@ -50,7 +55,6 @@ __all__ = [
     "IntentDraft",
     "IntentParser",
     "LLMIntentParser",
-    "RuleBasedIntentParser",
     "get_intent_agent",
     "ParameterExtractionAgent",
     "ParameterExtraction",
@@ -63,7 +67,6 @@ __all__ = [
     "APISelection",
     "CandidateAPI",
     "CandidateOperation",
-    "RejectedSuggestion",
     "SelectionSource",
     "LLMApiSelector",
     "get_api_selection_agent",
@@ -73,4 +76,7 @@ __all__ = [
     "RuleBasedPhraser",
     "LLMPhraser",
     "get_repair_agent",
+    "ItemSelectionAgent",
+    "ItemSelection",
 ]
+

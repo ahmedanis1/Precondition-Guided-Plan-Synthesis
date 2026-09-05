@@ -1,0 +1,12 @@
+# Development + optional dependencies. Mirrors pyproject.toml [project.optional-dependencies].
+-r requirements.txt
+
+# LLM provider integration (agents fall back to rule-based logic without it)
+langchain-anthropic>=0.3
+
+# Tooling
+pytest>=8.0
+pytest-asyncio>=0.23
+ruff>=0.5
+mypy>=1.10
+types-PyYAML
