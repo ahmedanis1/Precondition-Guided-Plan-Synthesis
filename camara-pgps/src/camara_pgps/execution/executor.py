@@ -56,6 +56,26 @@ _RESPONSE_FACT_FIELDS: dict[str, str] = {
 _OPERATION_RESPONSE_FACTS: dict[str, dict[str, str]] = {}
 
 
+def _is_affirmative(value: Any) -> bool:
+    """Interpret whatever fact a resolver operation produced as confirmed/not.
+
+    Handles CAMARA's boolean-enum convention ("TRUE"/"FALSE"/"PARTIAL"/"NO"/
+    "UNKNOWN"/empty -> False, anything else -> True) as well as plain
+    presence (None or an empty list/dict -> False, anything else -> True),
+    generically - no per-operation special-casing needed.
+    """
+
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().upper() not in {"", "FALSE", "PARTIAL", "NO", "UNKNOWN"}
+    if isinstance(value, (list, dict)):
+        return len(value) > 0
+    return True
+
+
 class ExecutionError(RuntimeError):
     """Raised for configuration problems that prevent execution starting."""
 
@@ -110,8 +130,119 @@ class APIExecutor(ABC):
         facts: dict[str, Any] = dict(initial_facts or {})
         step_results: list[StepExecution] = []
         succeeded = True
+        precondition_outcomes: list[dict[str, Any]] = []
+        handled_branches: set[int] = set()
 
-        for step in plan.steps:
+        # A mutable working copy: a precondition branch step (see
+        # agents.precondition_agent / PGPSPlanner._plan_precondition_branch)
+        # can splice in a completely different, already-fully-planned
+        # sub-sequence once its resolver step has actually run and its real
+        # outcome is known - the plan PGPS reported is only the *tentative*
+        # continuation, exactly like any other prediction made before the
+        # fact it depends on was actually checked.
+        steps_to_run: list[PlanStep] = list(plan.steps)
+        index = 0
+
+        while index < len(steps_to_run):
+            step = steps_to_run[index]
+
+            branch = step.precondition_branch
+            if branch and branch.get("resolver_step_index") not in handled_branches:
+                handled_branches.add(branch.get("resolver_step_index"))
+                resolved = self._resolve_precondition(branch, facts, step_results)
+
+                if branch.get("mode") == "gate":
+                    if not resolved:
+                        step_results.append(
+                            StepExecution(
+                                step_index=step.index,
+                                operation_id=step.operation_id,
+                                succeeded=True,
+                                skipped=True,
+                                response_body={
+                                    "skipped": True,
+                                    "reason": branch.get("reason")
+                                    or "the precondition was not confirmed",
+                                },
+                            )
+                        )
+                        precondition_outcomes.append(
+                            {
+                                "mode": "gate",
+                                "resolver_operation": branch.get("resolver_operation"),
+                                "resolved": False,
+                                "reason": branch.get("reason"),
+                                "ran_operation": None,
+                                "skipped_operation": branch.get("gated_operation"),
+                            }
+                        )
+                        # nothing further in this branch group to run - keep
+                        # the skipped step itself (step_results already has
+                        # an entry for it) but drop anything planned after it
+                        del steps_to_run[index + 1 :]
+                        index += 1
+                        continue
+                    precondition_outcomes.append(
+                        {
+                            "mode": "gate",
+                            "resolver_operation": branch.get("resolver_operation"),
+                            "resolved": True,
+                            "reason": branch.get("reason"),
+                            "ran_operation": branch.get("gated_operation"),
+                            "skipped_operation": None,
+                        }
+                    )
+                    # resolved: this step (already the gated operation) runs
+                    # normally below.
+                else:  # alternative
+                    real_id = (
+                        branch.get("if_resolved_operation")
+                        if resolved
+                        else branch.get("if_unresolved_operation")
+                    )
+                    ran_this_step_operation = step.operation_id == real_id
+                    precondition_outcomes.append(
+                        {
+                            "mode": "alternative",
+                            "resolver_operation": branch.get("resolver_operation"),
+                            "resolved": resolved,
+                            "reason": branch.get("reason"),
+                            "ran_operation": real_id,
+                            "skipped_operation": None,
+                        }
+                    )
+                    if not ran_this_step_operation:
+                        alt_dump = branch.get("alt_steps")
+                        if not alt_dump:
+                            step_results.append(
+                                StepExecution(
+                                    step_index=step.index,
+                                    operation_id=real_id or step.operation_id,
+                                    succeeded=False,
+                                    error=(
+                                        f"precondition resolved to {real_id!r} but "
+                                        "that branch was never planned (see plan "
+                                        "warnings)"
+                                    ),
+                                )
+                            )
+                            succeeded = False
+                            del steps_to_run[index + 1 :]
+                            index += 1
+                            if stop:
+                                break
+                            continue
+                        alt_steps = [PlanStep.model_validate(s) for s in alt_dump]
+                        base_index = step.index
+                        spliced = [
+                            alt_step.model_copy(update={"index": base_index + offset})
+                            for offset, alt_step in enumerate(alt_steps)
+                        ]
+                        steps_to_run[index:] = spliced
+                        continue
+                    # resolved to the same operation this step already is -
+                    # run it below, no splice needed.
+
             operation = self.registry.get_operation(step.operation_id)
             if operation is None:
                 step_results.append(
@@ -123,6 +254,7 @@ class APIExecutor(ABC):
                     )
                 )
                 succeeded = False
+                index += 1
                 if stop:
                     break
                 continue
@@ -138,17 +270,38 @@ class APIExecutor(ABC):
             else:
                 succeeded = False
             step_results.append(step_exec)
+            index += 1
             if not step_exec.succeeded and stop:
                 break
 
+        if precondition_outcomes:
+            metadata["precondition_outcomes"] = precondition_outcomes
+
         return ExecutionResult(
-            succeeded=succeeded and len(step_results) == len(plan.steps),
+            succeeded=succeeded and len(step_results) == len(steps_to_run),
             steps=step_results,
             facts=facts,
             started_at=started,
             finished_at=datetime.now(tz=UTC),
             metadata=metadata,
         )
+
+    def _resolve_precondition(
+        self,
+        branch: Mapping[str, Any],
+        facts: Mapping[str, Any],
+        step_results: list[StepExecution],
+    ) -> bool:
+        """Was the resolver's check confirmed? Read from its real, already-executed result."""
+
+        resolver_facts = branch.get("resolver_produces") or []
+        if resolver_facts:
+            return any(_is_affirmative(facts.get(fact)) for fact in resolver_facts)
+        resolver_index = branch.get("resolver_step_index")
+        resolver_result = next(
+            (s for s in step_results if s.step_index == resolver_index), None
+        )
+        return bool(resolver_result and resolver_result.succeeded)
 
     # -- subclass hook -----------------------------------------------------
 
@@ -314,7 +467,20 @@ class APIExecutor(ABC):
                 facts[fact_key] = body[field]
         for fact_key in produced:
             if fact_key not in facts:
-                facts[fact_key] = True
+                if fact_key in field_map:
+                    # The operation declares exactly which response field
+                    # carries this fact, but that field isn't in the body -
+                    # for a discovery/verify-style operation
+                    # (retrieveSessionsByDevice returning no sessions,
+                    # verifyLocation not confirming) that absence is itself
+                    # the meaningful answer, not something to paper over
+                    # with a blanket True the way an operation with no
+                    # produces_from mapping at all gets (below) - conflating
+                    # the two is exactly what let a precondition check
+                    # report "confirmed" no matter what it actually found.
+                    facts[fact_key] = False
+                else:
+                    facts[fact_key] = True
             alias = _FACT_ALIASES.get(fact_key)
             if alias:
                 facts.setdefault(alias, facts[fact_key])

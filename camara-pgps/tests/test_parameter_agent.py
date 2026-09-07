@@ -169,3 +169,40 @@ def test_metadata_reports_extractor(agent: ParameterExtractionAgent) -> None:
     result = agent.extract("improve quality", ["createSession"])
     assert result.metadata["extractor"] == RuleBasedParameterExtractor.__name__
     assert result.metadata["operations"] == ["createSession"]
+
+
+# --------------------------------------------------------------------------- #
+# a place name is not a geofencing area (real Ollama-backed run regression)
+# --------------------------------------------------------------------------- #
+
+def test_a_place_name_does_not_ground_a_geofencing_area(
+    agent: ParameterExtractionAgent,
+) -> None:
+    """Real bug from an Ollama-backed run of "Notify me whenever I leave the
+    office.": the intent's own "location" entity ("office") was aliased
+    straight into verifyLocation's ``area`` parameter, because
+    ``_PARAM_ALIASES["area"]`` used to treat "location"/"place"/"region"/
+    "zone" as synonyms for it. ``area`` is a structured geofencing circle
+    (center coordinates + radius) - there is no way to derive one from a
+    bare place name - so binding "office" into it produced a plan that
+    looked complete but failed payload validation with a confusing
+    "'office' is not of type 'object'" schema error instead of asking the
+    user for real coordinates. Unlike "device" (a phone number *is*
+    legitimately the value a device-object parameter needs, just not yet
+    wrapped), a place name is never the right shape for an area, so the
+    fix narrows the alias group rather than adding a blanket
+    object/array-type guard - the latter was tried first and broke the
+    device case above (`test_extracts_grounded_values_from_the_request`,
+    `test_llm_values_must_be_grounded_in_the_request`).
+    """
+    intent = Intent(
+        text="Notify me whenever I leave the office.",
+        goal="Monitor departure from the office",
+        action="monitor",
+        entities=[IntentEntity(name="location", value="office")],
+    )
+    result = agent.extract(intent, ["verifyLocation"])
+    verify = result.for_operation("verifyLocation")
+    assert verify is not None
+    assert "area" not in verify.arguments
+    assert "area" in verify.missing_required

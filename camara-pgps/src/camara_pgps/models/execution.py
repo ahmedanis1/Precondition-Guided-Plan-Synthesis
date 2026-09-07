@@ -37,6 +37,11 @@ class StepExecution(BaseModel):
     response_headers: dict[str, str] = Field(default_factory=dict)
     succeeded: bool = False
     error: str | None = None
+    # True when this step was deliberately never called - a gate whose
+    # resolver did not confirm the condition (see agents.precondition_agent)
+    # rather than a failure. `succeeded` stays True for a skipped step: the
+    # pipeline behaved correctly, it just correctly declined to run it.
+    skipped: bool = False
     extracted_facts: dict[str, Any] = Field(default_factory=dict)
     started_at: datetime | None = None
     finished_at: datetime | None = None

@@ -68,6 +68,18 @@ class PlanStep(BaseModel):
     requires: list[str] = Field(default_factory=list)
     produces: list[str] = Field(default_factory=list)
     rationale: str | None = None
+    # Set only on a step whose real operation isn't known until execution -
+    # a check-then-branch or a gate (see agents.precondition_agent). Carries
+    # everything the executor needs to resolve the real operation once the
+    # resolver step (referenced by resolver_step_index) has actually run:
+    # mode, resolver_operation, resolver_produces, if_resolved_operation /
+    # if_unresolved_operation (alternative mode) or gated_operation (gate
+    # mode), reason, and - for alternative mode - alt_steps: the fully
+    # planned step sequence for the branch NOT shown here, serialised via
+    # PlanStep.model_dump(), so the executor can splice it in wholesale if
+    # that turns out to be the real branch instead of re-planning at
+    # execution time.
+    precondition_branch: dict[str, Any] | None = None
 
     def unresolved_bindings(self) -> list[ParameterBinding]:
         """Return required bindings that still have no value source."""

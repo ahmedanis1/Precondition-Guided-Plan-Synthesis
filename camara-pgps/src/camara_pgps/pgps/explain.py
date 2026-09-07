@@ -4,10 +4,22 @@ Turns a :class:`~camara_pgps.models.plan.PlanResult` into a structured account o
 *why* the plan has the shape it does::
 
     Goal -> Selected APIs -> Required facts -> Produced facts
-         -> Dependencies -> Execution order
+         -> Dependencies -> Execution order -> Conditional branch(es)
 
 Every field comes from the operations' pre/postconditions and the fact-flow edges
 between them; :attr:`PlanExplanation.source` is fixed to ``pgps-dependency-graph``.
+
+The last part - conditional branches - answers a question this module used
+to leave entirely to hindsight: *before* any execution happens, how many
+check-then-branch decisions did PGPS build into this plan, what triggers
+each one, and what would run on either side of it? A plan step tagged with
+``precondition_branch`` (see ``pgps/planner.py::_plan_precondition_branch``)
+carries exactly that - which operation resolves the check, whether it's an
+``"alternative"`` (two real continuations) or a ``"gate"`` (one, or
+nothing), and, for an alternative, the *other* continuation's own steps
+serialized as ``alt_steps`` - so this module can show both sides of a
+decision before either one has actually run, not just narrate whichever
+side execution happened to pick afterward.
 """
 
 from __future__ import annotations
@@ -54,6 +66,27 @@ class StepExplanation(BaseModel):
     reason: str
 
 
+class BranchExplanation(BaseModel):
+    """One check-then-branch decision PGPS built into the plan, and what's
+    pre-validated on either side of it - known before any execution happens.
+    """
+
+    resolver_operation: str
+    mode: str  # "alternative" | "gate"
+    reason: str | None = None
+    default_path: list[str] = Field(default_factory=list)
+    """Operations that run if the check confirms the assumed default - these
+    are already spliced into `execution_order` above, not held separately."""
+    alternate_path: list[str] = Field(default_factory=list)
+    """For `mode="alternative"`: the *other* fully-planned continuation,
+    pre-validated but not spliced into the main plan unless execution picks
+    it. Empty for `mode="gate"` (see `alternate_note` instead)."""
+    alternate_note: str | None = None
+    """For `mode="gate"`: what happens instead of `default_path` when the
+    check isn't confirmed (the gated operation(s) are skipped entirely, not
+    replaced by another operation)."""
+
+
 class PlanExplanation(BaseModel):
     """A graph-derived explanation of a plan."""
 
@@ -66,6 +99,7 @@ class PlanExplanation(BaseModel):
     produced_facts: list[FactProvenance] = Field(default_factory=list)
     dependencies: list[DependencyExplanation] = Field(default_factory=list)
     execution_order: list[StepExplanation] = Field(default_factory=list)
+    branches: list[BranchExplanation] = Field(default_factory=list)
     narrative: str = ""
 
 
@@ -211,6 +245,66 @@ def explain_plan(
 
     goal_facts = [str(f) for f in (plan.metadata.get("goal_facts") or [])]
 
+    # -- conditional branches ------------------------------------------------
+    # A branch point is identified by its `precondition_branch` payload
+    # (planner.py tags every spliced default-branch step with the *same*
+    # dict), not by step position - grouping by content rather than object
+    # identity means this still works after a JSON round-trip (e.g. a plan
+    # that arrived over the HTTP API rather than in-process).
+    branches: list[BranchExplanation] = []
+    seen_branch_keys: set[tuple[str | None, ...]] = set()
+    for step in steps:
+        branch = step.precondition_branch
+        if not branch:
+            continue
+        key = (
+            branch.get("mode"),
+            branch.get("resolver_operation"),
+            branch.get("reason"),
+        )
+        if key in seen_branch_keys:
+            continue
+        seen_branch_keys.add(key)
+
+        default_path = [
+            s.operation_id
+            for s in steps
+            if s.precondition_branch is not None
+            and (
+                s.precondition_branch.get("mode"),
+                s.precondition_branch.get("resolver_operation"),
+                s.precondition_branch.get("reason"),
+            )
+            == key
+        ]
+
+        mode = branch.get("mode")
+        if mode == "alternative":
+            alt_steps = branch.get("alt_steps") or []
+            alternate_path = [
+                s.get("operation_id") for s in alt_steps if s.get("operation_id")
+            ]
+            alternate_note = None
+        else:  # "gate" - there is no other operation, only "don't run it"
+            alternate_path = []
+            gated = branch.get("gated_operation") or (default_path[0] if default_path else None)
+            alternate_note = (
+                f"{gated} is skipped entirely - not replaced by anything else"
+                if gated
+                else "the gated operation(s) are skipped entirely"
+            )
+
+        branches.append(
+            BranchExplanation(
+                resolver_operation=branch.get("resolver_operation") or "",
+                mode=mode or "",
+                reason=branch.get("reason"),
+                default_path=default_path,
+                alternate_path=alternate_path,
+                alternate_note=alternate_note,
+            )
+        )
+
     explanation = PlanExplanation(
         goal=intent.goal if intent is not None else None,
         goal_facts=goal_facts,
@@ -220,6 +314,7 @@ def explain_plan(
         produced_facts=produced_facts,
         dependencies=dependencies,
         execution_order=execution_order,
+        branches=branches,
     )
     explanation.narrative = render_narrative(explanation)
     return explanation
@@ -258,6 +353,25 @@ def render_narrative(explanation: PlanExplanation) -> str:
             f"  {step_item.order}. {step_item.operation_id}{api} - {step_item.reason}"
         )
 
+    # Conditional branches are synthesized and fully planned *before* any
+    # execution happens (Section 4.7/4.8 of docs/design-decisions.md) - this
+    # is where that becomes visible pre-execution, not just afterward in the
+    # post-run narrative (workflow/report.py), which can only ever describe
+    # the one side execution actually picked.
+    lines.append(f"\nConditional branch(es): {len(explanation.branches)}")
+    for i, branch in enumerate(explanation.branches, start=1):
+        header = f"  Branch {i} - check via {branch.resolver_operation} ({branch.mode})"
+        if branch.reason:
+            header += f": {branch.reason}"
+        lines.append(header)
+        default_chain = " -> ".join(branch.default_path) or "(nothing)"
+        lines.append(f"    IF confirmed      -> {default_chain}")
+        if branch.mode == "alternative":
+            alt_chain = " -> ".join(branch.alternate_path) or "(nothing)"
+            lines.append(f"    IF NOT confirmed  -> {alt_chain}")
+        else:
+            lines.append(f"    IF NOT confirmed  -> {branch.alternate_note}")
+
     return "\n".join(lines)
 
 
@@ -267,6 +381,7 @@ __all__ = [
     "FactProvenance",
     "DependencyExplanation",
     "StepExplanation",
+    "BranchExplanation",
     "explain_plan",
     "render_narrative",
 ]

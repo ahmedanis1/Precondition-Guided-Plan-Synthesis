@@ -12,6 +12,7 @@ from typing import Any
 from camara_pgps.agents.api_selection_agent import APISelectionAgent
 from camara_pgps.agents.intent_agent import IntentAgent
 from camara_pgps.agents.parameter_agent import ParameterExtractionAgent, fact_for_parameter
+from camara_pgps.agents.precondition_agent import PreconditionAgent, PreconditionBrief
 from camara_pgps.agents.repair_agent import RepairAgent
 from camara_pgps.camara.registry import CamaraRegistry
 from camara_pgps.config import Settings, get_settings
@@ -114,6 +115,7 @@ class WorkflowNodes:
         validator: PlanValidator | None = None,
         executor: APIExecutor | None = None,
         repair_agent: RepairAgent | None = None,
+        precondition_agent: PreconditionAgent | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.registry = registry or CamaraRegistry.from_settings(self.settings)
@@ -126,6 +128,12 @@ class WorkflowNodes:
         self.parameter_agent = parameter_agent or ParameterExtractionAgent(
             registry=self.registry, settings=self.settings
         )
+        # Built once and shared by the planner, validator and the
+        # precondition agent below - all three must reason about the exact
+        # same dependency graph, and building it three times separately is
+        # how it would drift out of sync if one call site's settings/loader
+        # path ever changed without the others following.
+        self.condition_model = build_condition_model(settings=self.settings)
         self.planner = planner or PGPSPlanner(
             registry=self.registry,
             # Explicit, because passing only `registry=` here would make
@@ -140,7 +148,7 @@ class WorkflowNodes:
             # is kept alongside purely so the planner can still resolve
             # method/path for an operation the solver discovers that wasn't
             # itself a candidate.
-            condition_model=build_condition_model(settings=self.settings),
+            condition_model=self.condition_model,
             settings=self.settings,
         )
         self.validator = validator or PlanValidator(
@@ -151,10 +159,11 @@ class WorkflowNodes:
             # conditions, which silently turns its structural precondition
             # check into a no-op instead of an independent check against the
             # real data/conditions/ dependency graph.
-            condition_model=build_condition_model(settings=self.settings),
+            condition_model=self.condition_model,
             settings=self.settings,
         )
         self._repair_agent = repair_agent
+        self._precondition_agent = precondition_agent
         self._executor = executor
 
     # -- lazily built (may need an LLM / touch external state) --------------
@@ -170,6 +179,14 @@ class WorkflowNodes:
         if self._repair_agent is None:
             self._repair_agent = RepairAgent.from_settings(self.settings)
         return self._repair_agent
+
+    @property
+    def precondition_agent(self) -> PreconditionAgent:
+        if self._precondition_agent is None:
+            self._precondition_agent = PreconditionAgent.from_settings(
+                condition_model=self.condition_model, settings=self.settings
+            )
+        return self._precondition_agent
 
     @property
     def rag(self) -> RagRetriever:
@@ -295,6 +312,113 @@ class WorkflowNodes:
             ],
         }
 
+    def precondition_node(self, state: AgentState) -> _Update:
+        """Declare - never execute - any check-then-branch or gate that applies.
+
+        ``PreconditionAgent`` makes exactly one grounded judgement call and
+        never calls anything itself. This node used to also perform the
+        actual check right here, in a side plan/validate/execute cycle of
+        its own - which worked, but hid a real API call from the plan and
+        execution trace PGPS reports, since that call happened before
+        planning even started. It does not do that anymore: this node only
+        widens the candidate set (so parameter extraction grounds arguments
+        for the resolver and every branch operation too) and hands the
+        brief to PGPS as plain data. PGPS (`_plan_precondition_branch`) is
+        what puts the resolver in as a real, first step of the one plan it
+        returns, and the executor is what actually runs it and picks the
+        real branch from its real result - so the check is now a visible
+        part of the same plan and the same execution trace as everything
+        else, not a hidden pre-flight step.
+
+        Any failure (agent unavailable, brief doesn't ground) degrades to
+        doing nothing: the pipeline continues exactly as it would without
+        this node.
+        """
+
+        if state.stage is PipelineStage.FAILED or not state.selected_operations:
+            return {}
+
+        candidates_by_id: dict[str, Any] = {
+            op.operation_id: op for op in state.selected_operations
+        }
+        selection = state.selection
+        for operation_id in getattr(selection, "rejected", []) or []:
+            if operation_id in candidates_by_id:
+                continue
+            sibling = self.registry.get_operation(operation_id)
+            if sibling is not None:
+                candidates_by_id[operation_id] = sibling
+
+        try:
+            brief = self.precondition_agent.assess(
+                intent=state.intent, candidates=list(candidates_by_id.values())
+            )
+        except Exception:  # noqa: BLE001 - reasoning must never block the pipeline
+            return {}
+
+        if not brief.applies or brief.resolver_operation is None:
+            return {}
+
+        resolver_op = candidates_by_id.get(brief.resolver_operation)
+        if resolver_op is None:
+            return {}
+
+        if brief.mode == "alternative":
+            branch_ids = [brief.if_resolved_operation, brief.if_unresolved_operation]
+        elif brief.mode == "gate":
+            branch_ids = [brief.gated_operation]
+        else:
+            return {}
+        branch_ops = [candidates_by_id.get(bid) for bid in branch_ids if bid]
+        if len(branch_ops) != len(branch_ids) or any(op is None for op in branch_ops):
+            return {}
+
+        # Widen the working candidate set - resolver, then each branch
+        # operation, then whatever was already selected - deduped by
+        # operation id so parameter extraction (the next node) grounds
+        # arguments for all of them, whichever one PGPS/the executor ends
+        # up actually running.
+        ordered: dict[str, Any] = {resolver_op.operation_id: resolver_op}
+        for op in branch_ops:
+            ordered.setdefault(op.operation_id, op)
+        for op in state.selected_operations:
+            ordered.setdefault(op.operation_id, op)
+
+        precondition_brief = {
+            "mode": brief.mode,
+            "resolver_operation": resolver_op.operation_id,
+            "if_resolved_operation": brief.if_resolved_operation,
+            "if_unresolved_operation": brief.if_unresolved_operation,
+            "gated_operation": brief.gated_operation,
+            "reason": brief.reason,
+            # Every sibling this node looked at while grounding the brief -
+            # not just the resolver/branch operations that made it into
+            # `selected_operations` below. Kept narrow there so parameter
+            # extraction and the final narrative aren't bloated with
+            # irrelevant operations (verifyLocation, checkSimSwap, ...) -
+            # but the planner needs the full pool too: if the LLM's chosen
+            # resolver turns out circular (e.g. getSession, which itself
+            # needs the very session id it's meant to help discover), it
+            # can look here for a real observation operation to swap in
+            # instead (e.g. retrieveSessionsByDevice), rather than
+            # abandoning the whole conditional plan.
+            "candidate_pool": sorted(candidates_by_id.keys()),
+        }
+
+        return {
+            "selected_operations": list(ordered.values()),
+            "metadata": {**state.metadata, "precondition_brief": precondition_brief},
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        f"precondition declared ({brief.mode}): check "
+                        f"{resolver_op.operation_id} first - {brief.reason}"
+                    ),
+                }
+            ],
+        }
+
     def parameters_node(self, state: AgentState) -> _Update:
         if state.stage is PipelineStage.FAILED or state.intent is None:
             return {}
@@ -333,21 +457,35 @@ class WorkflowNodes:
         if state.stage is PipelineStage.FAILED or state.intent is None:
             return {}
 
-        # the goal is what the top-ranked selected operation produces
+        # When `precondition_node` declared a check-then-branch or a gate,
+        # hand its brief straight to PGPS as plain data - PGPS is what turns
+        # it into a real plan (resolver as a real first step, the branch
+        # operation's own fully chained sub-plan after it), not this node.
+        # Only derive `goal_facts` the ordinary way when there is no brief:
+        # that derivation reads `selected_operations[0]` as *the* goal, which
+        # is meaningless once precondition_node has widened that list to
+        # include the resolver and every branch candidate too.
+        precondition_brief = (state.metadata or {}).get("precondition_brief")
+
         goal_facts: list[str] = []
-        selection = state.selection
-        if selection is not None and selection.operations:
-            top = selection.operations[0].operation
+        if not precondition_brief and state.selected_operations:
+            top = state.selected_operations[0]
             goal_facts = sorted(
                 {fact for cond in top.postconditions for fact in cond.produces}
             )
+
+        metadata: dict[str, Any] = {}
+        if precondition_brief:
+            metadata["precondition_brief"] = precondition_brief
+        elif goal_facts:
+            metadata["goal_facts"] = goal_facts
 
         request = PlanRequest(
             intent=state.intent,
             candidate_operations=state.selected_operations,
             retrieval=state.retrieval,
             known_facts=dict(state.facts),
-            metadata={"goal_facts": goal_facts} if goal_facts else {},
+            metadata=metadata,
         )
         return {"plan_request": request, "stage": PipelineStage.PLANNING}
 

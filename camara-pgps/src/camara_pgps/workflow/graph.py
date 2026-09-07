@@ -1,7 +1,8 @@
 """The LangGraph workflow that wires every component into one agentic system.
 
-    START -> intent -> rag -> selection -> parameters -> build_plan_request
-          -> pgps -> (clarification | validation) -> (clarification | execution) -> END
+    START -> intent -> rag -> selection -> precondition_check -> parameters
+          -> build_plan_request -> pgps -> (clarification | validation)
+          -> (clarification | execution) -> END
 
 The state schema is :class:`~camara_pgps.models.state.AgentState` from milestone 2.
 """
@@ -25,15 +26,27 @@ _PLAN_NODES = (
     "intent_node",
     "rag_node",
     "selection_node",
+    "precondition_node",
     "parameters_node",
     "build_plan_request_node",
     "pgps_node",
 )
 
 
-def _merge_state(state: AgentState, update: dict[str, Any]) -> AgentState:
-    """Apply a node's partial update to the state (append-only fields accumulate)."""
+def _merge_state(state: AgentState, update: dict[str, Any] | None) -> AgentState:
+    """Apply a node's partial update to the state (append-only fields accumulate).
 
+    Many nodes legitimately have a "nothing to do" branch that returns ``{}``
+    (see e.g. ``precondition_node`` when nothing was selected) - an
+    intentional no-op, not a failure. LangGraph's ``stream_mode="updates"``
+    reports that no-op as the update value ``None`` rather than ``{}`` for at
+    least some nodes, so ``update`` must be treated as optional here too, or
+    a request that selects zero operations (e.g. no CAMARA API matches the
+    request at all) crashes instead of degrading to a clarification.
+    """
+
+    if not update:
+        return state
     new = state.model_copy()
     for key, value in update.items():
         if key in ("messages", "errors"):
@@ -93,6 +106,7 @@ class CamaraWorkflow:
         graph.add_node("understand_intent", node.intent_node)
         graph.add_node("rag_retrieval", node.rag_node)
         graph.add_node("api_selection", node.selection_node)
+        graph.add_node("precondition_check", node.precondition_node)
         graph.add_node("parameter_extraction", node.parameters_node)
         graph.add_node("assemble_plan_request", node.build_plan_request_node)
         graph.add_node("pgps_solve", node.pgps_node)
@@ -103,7 +117,8 @@ class CamaraWorkflow:
         graph.add_edge(START, "understand_intent")
         graph.add_edge("understand_intent", "rag_retrieval")
         graph.add_edge("rag_retrieval", "api_selection")
-        graph.add_edge("api_selection", "parameter_extraction")
+        graph.add_edge("api_selection", "precondition_check")
+        graph.add_edge("precondition_check", "parameter_extraction")
         graph.add_edge("parameter_extraction", "assemble_plan_request")
         graph.add_edge("assemble_plan_request", "pgps_solve")
         graph.add_conditional_edges(

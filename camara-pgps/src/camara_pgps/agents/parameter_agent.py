@@ -44,8 +44,24 @@ _IPV4_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 _UUID_RE = re.compile(
     r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
 )
-_DURATION_RE = re.compile(r"(\d+)\s*(second|minute|hour|day)s?", re.IGNORECASE)
+_DURATION_RE = re.compile(
+    r"(\d+|[a-z]+)\s*(?:of\s+)?(second|minute|hour|day)s?", re.IGNORECASE
+)
 _DURATION_UNIT_SECONDS = {"second": 1, "minute": 60, "hour": 3600, "day": 86400}
+_HALF_HOUR_RE = re.compile(r"half\s+an?\s+hour", re.IGNORECASE)
+# Spelled-out quantities ("two hours", "an hour", "a couple of hours") - a
+# user typing a duration in words is at least as common as typing digits, and
+# without this the regex above never fires for a request like "next two
+# hours", so no duration ever reaches the pool and the pipeline asks the
+# user to re-state something they already said.
+_NUMBER_WORDS: dict[str, int] = {
+    "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+    "couple": 2,
+}
 _PRIORITY_RE = re.compile(r"\b(high|medium|normal|low)\s+priority\b", re.IGNORECASE)
 
 # parameter name (normalised) -> accepted synonyms in the value pool
@@ -70,7 +86,8 @@ _PARAM_ALIASES: dict[str, set[str]] = {
         "requestedadditionalduration", "additionalduration",
         "requestedduration", "sessionduration", "durationseconds",
     },
-    "area": {"area", "location", "region", "zone", "geofence", "coordinates", "place"},
+    # Deliberately narrow: "area" is a structured geofencing circle (center coordinates + radius), not a place name - unlike "device" below, there is no way to derive one from a bare word like "office" or "downtown", so words that only describe an informal place ("location", "place", "region", "zone") are excluded on purpose. Widening this back to include them reintroduces the exact bug this comment is guarding against: a place-name string silently bound into an object-typed parameter, which then fails payload validation with a confusing schema error instead of asking the user for real coordinates. "coordinates" itself stays, since that word actually implies the right kind of data.
+    "area": {"area", "geofence", "coordinates"},
     "sessionid": {"sessionid", "session"},
     "subscriptionid": {"subscriptionid", "subscription"},
     "priority": {"priority", "importance", "urgency"},
@@ -443,11 +460,19 @@ class ParameterExtractionAgent:
         ipv4 = _IPV4_RE.search(text)
         if ipv4 and not uuid:
             pool.setdefault("ipaddress", ipv4.group(0))
-        duration = _DURATION_RE.search(text)
-        if duration:
-            amount = int(duration.group(1))
-            unit = duration.group(2).lower()
-            pool.setdefault("duration", amount * _DURATION_UNIT_SECONDS[unit])
+        for duration in _DURATION_RE.finditer(text):
+            raw_amount, unit = duration.group(1), duration.group(2).lower()
+            amount = (
+                int(raw_amount)
+                if raw_amount.isdigit()
+                else _NUMBER_WORDS.get(raw_amount.lower())
+            )
+            if amount:
+                pool.setdefault("duration", amount * _DURATION_UNIT_SECONDS[unit])
+                break
+        else:
+            if _HALF_HOUR_RE.search(text):
+                pool.setdefault("duration", 30 * _DURATION_UNIT_SECONDS["minute"])
         priority = _PRIORITY_RE.search(text)
         if priority:
             pool.setdefault("priority", priority.group(1).upper())

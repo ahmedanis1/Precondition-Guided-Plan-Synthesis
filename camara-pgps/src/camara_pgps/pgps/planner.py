@@ -103,6 +103,18 @@ class PGPSPlanner:
         }
 
         initial_facts = set(request.known_facts)
+
+        brief = request.metadata.get("precondition_brief")
+        if brief:
+            branch_plan = self._plan_precondition_branch(
+                request, brief, operations_by_id, initial_facts
+            )
+            if branch_plan is not None:
+                return branch_plan
+            # Brief didn't ground (an unknown operation id, or its branch(es)
+            # don't plan at all) - fall through to ordinary planning exactly
+            # as if no brief had been given, rather than failing the request
+            # over a check that turned out not to be groundable.
         # An *explicit* metadata['goal_facts'] (the plan_for()/legacy path,
         # and every existing hand-written test) means "here is a pool of
         # candidate operations - find the minimal subset that reaches this
@@ -198,6 +210,360 @@ class PGPSPlanner:
             metadata={"goal_facts": list(goals)},
         )
         return self.plan(request)
+
+    # -- precondition branch (check-then-branch / gate) ---------------------
+
+    def _find_observation_replacement(
+        self,
+        facts: list[str],
+        operations_by_id: dict[str, CamaraOperation],
+        initial_facts: set[str],
+        exclude: set[str],
+        extra_pool_ids: list[str] | None = None,
+    ) -> tuple[str, CamaraOperation] | None:
+        """Find a real, already-satisfiable producer of ``facts`` to use as
+        the resolver instead, when the LLM's chosen one turned out circular.
+
+        A genuine observation operation for this purpose is one that (a) is
+        already a candidate operation - not something invented, mirroring
+        the grounding discipline everywhere else in this planner, (b) is
+        not one of the branch destinations themselves (a branch's own
+        effect is not a precondition check for entering that branch), and
+        (c) needs nothing beyond what's already known, so it can still be
+        an unconditional first step exactly like the LLM's original pick
+        was meant to be.
+
+        ``operations_by_id`` alone is often too narrow here: it's built
+        from `state.selected_operations`, and `precondition_node`
+        deliberately only widens that to the resolver, the branch
+        operations and whatever was originally selected - not every
+        sibling it looked at while grounding the brief (that would bloat
+        parameter extraction and the final narrative with irrelevant
+        operations). ``extra_pool_ids`` is that fuller sibling list
+        (`precondition_brief["candidate_pool"]`), resolved against the
+        registry directly, so a real observation operation sitting right
+        next to a bad resolver choice (e.g. retrieveSessionsByDevice next
+        to getSession, both from the same API) is still visible here even
+        though it never made it into `selected_operations`.
+
+        Iteration order follows ``operations_by_id`` first, then
+        ``extra_pool_ids``, so the choice is deterministic for a given
+        request.
+        """
+
+        needed = set(facts)
+
+        def _consider(operation_id: str, operation: CamaraOperation | None):
+            if operation is None or operation_id in exclude:
+                return None
+            conditions = self.model.get(operation_id)
+            if conditions is None:
+                return None
+            if not (needed & set(conditions.produces)):
+                return None
+            if set(conditions.requires) - initial_facts:
+                return None
+            return operation_id, operation
+
+        for operation_id, operation in operations_by_id.items():
+            found = _consider(operation_id, operation)
+            if found is not None:
+                return found
+
+        for operation_id in extra_pool_ids or []:
+            if operation_id in operations_by_id:
+                continue  # already tried above
+            found = _consider(operation_id, self.registry.get_operation(operation_id))
+            if found is not None:
+                return found
+
+        return None
+
+    def _plan_precondition_branch(
+        self,
+        request: PlanRequest,
+        brief: dict,
+        operations_by_id: dict[str, CamaraOperation],
+        initial_facts: set[str],
+    ) -> PlanResult | None:
+        """Build a plan whose step 0 is a real precondition check.
+
+        This is what puts the check literally *in* the plan PGPS reports and
+        the executor runs, instead of resolving it somewhere else before
+        planning even starts: step 0 is always the resolver operation
+        (forced in - the whole point is to run it for real, not skip it
+        because some fact it produces already looks "known"), and the
+        remaining steps are a normal, fully backward-chained sub-plan for
+        the branch operation applies-optimistically-assumes, tagged so the
+        executor can tell, once the resolver has actually run, whether that
+        assumption held - and if not, splice in the other branch's own
+        (also fully chained) sub-plan instead. Neither branch is executed
+        here; this method only plans, exactly like every other path through
+        this planner.
+        """
+
+        mode = brief.get("mode")
+        resolver_id = brief.get("resolver_operation")
+        resolver_op = operations_by_id.get(resolver_id)
+        if resolver_op is None:
+            return None
+
+        if mode == "alternative":
+            default_id = brief.get("if_resolved_operation")
+            other_id = brief.get("if_unresolved_operation")
+        elif mode == "gate":
+            default_id = brief.get("gated_operation")
+            other_id = None
+        else:
+            return None
+
+        default_op = operations_by_id.get(default_id) if default_id else None
+        if default_op is None:
+            return None
+        if other_id is not None and other_id not in operations_by_id:
+            return None
+
+        resolver_conditions = self.model.get(resolver_id)
+        resolver_requires = sorted(resolver_conditions.requires) if resolver_conditions else []
+        resolver_produces = sorted(resolver_conditions.produces) if resolver_conditions else []
+
+        warnings: list[str] = []
+        unmet_resolver = sorted(set(resolver_requires) - initial_facts)
+        if unmet_resolver:
+            # An unmet requirement with NO producer anywhere is just a
+            # genuine gap (typically something that belongs in initial
+            # facts, e.g. an auth token) - forcing the resolver in as step 0
+            # anyway and surfacing a warning is the existing, harmless
+            # behaviour for that case.
+            #
+            # But when the missing fact *does* have a real producer, this
+            # resolver is circular (e.g. the LLM picking getSession - which
+            # itself requires qos.session.id - as the check for *whether a
+            # session exists at all*: the very thing that fact would come
+            # from). It can never legitimately run first. Rather than give
+            # up on the whole conditional plan and fall back to ordinary
+            # planning - which has no notion of "these are alternatives,
+            # only run one" and ends up demanding parameters for every
+            # branch at once - look for a real observation operation
+            # already among the candidates that can serve as the resolver
+            # instead: one that actually produces the missing fact and
+            # needs nothing beyond what's already known, so it can still be
+            # a clean, unconditional first step. This is exactly what
+            # api_selection's own rejected siblings exist for - e.g.
+            # retrieveSessionsByDevice sitting right next to getSession.
+            circular = [fact for fact in unmet_resolver if self.model.producers_of(fact)]
+            if circular:
+                replacement = self._find_observation_replacement(
+                    circular,
+                    operations_by_id,
+                    initial_facts,
+                    exclude={resolver_id, default_id, other_id} - {None},
+                    extra_pool_ids=brief.get("candidate_pool"),
+                )
+                if replacement is None:
+                    return None
+                original_resolver_id = resolver_id
+                resolver_id, resolver_op = replacement
+                warnings.append(
+                    f"{original_resolver_id}: circular precondition check "
+                    f"(needs {circular} to discover it) - "
+                    f"using {resolver_id} as the resolver instead"
+                )
+                resolver_conditions = self.model.get(resolver_id)
+                resolver_requires = (
+                    sorted(resolver_conditions.requires) if resolver_conditions else []
+                )
+                resolver_produces = (
+                    sorted(resolver_conditions.produces) if resolver_conditions else []
+                )
+                unmet_resolver = sorted(set(resolver_requires) - initial_facts)
+                if unmet_resolver:
+                    # The replacement turned out not to be clean either -
+                    # don't chain replacements recursively, just bail.
+                    return None
+            else:
+                warnings.append(f"{resolver_id}: unmet precondition(s) {unmet_resolver}")
+
+        # Two sanity checks specific to "alternative" mode, both found from
+        # real (Ollama-backed) runs where the LLM's own reasoning, not
+        # anything mechanical, was the source of the mistake - grounding a
+        # brief against real operation ids (as this planner always has)
+        # says nothing about whether the *pairing* of resolver and branches
+        # actually makes sense together.
+        if mode == "alternative" and other_id is not None:
+            other_op = operations_by_id[other_id]
+            default_conditions = self.model.get(default_id)
+            other_conditions = self.model.get(other_id)
+            default_produces = set(default_conditions.produces) if default_conditions else set()
+            other_produces = set(other_conditions.produces) if other_conditions else set()
+            other_requires = set(other_conditions.requires) if other_conditions else set()
+            default_requires = set(default_conditions.requires) if default_conditions else set()
+            resolver_fact_set = set(resolver_produces)
+
+            # (a) Backwards assignment: the "confirmed" (if_resolved) branch
+            # re-produces the very resource the resolver just confirmed
+            # already exists (e.g. resolver confirms a subscription exists,
+            # but if_resolved_operation is the *create* operation - which
+            # would create a duplicate of something just confirmed present)
+            # while the "not confirmed" (if_unresolved) branch does not.
+            # That is exactly backwards: creating something is what belongs
+            # on the *not-confirmed* side. Swap them rather than reject the
+            # whole branch - the check itself is still meaningful, only the
+            # LLM's mapping of which side is which was inverted.
+            if (resolver_fact_set & default_produces) and not (resolver_fact_set & other_produces):
+                warnings.append(
+                    f"{default_id}/{other_id}: swapped - {default_id} would "
+                    f"re-produce {sorted(resolver_fact_set & default_produces)}, "
+                    "which the check just confirmed already exists; that "
+                    f"belongs on the not-confirmed side, not {other_id}"
+                )
+                default_id, other_id = other_id, default_id
+                default_op, other_op = other_op, default_op
+                default_conditions, other_conditions = other_conditions, default_conditions
+                default_produces, other_produces = other_produces, default_produces
+                default_requires, other_requires = other_requires, default_requires
+
+            # (b) No structural relationship at all: neither branch requires
+            # or produces anything the resolver itself produces. A
+            # legitimate check-then-branch means the branches' own shape
+            # (usually: one of them needs the fact the check discovers)
+            # actually depends on what was checked - if it doesn't, the
+            # "check" and the "branch" are about two unrelated things the
+            # LLM only linked in its own narrative, not in the fact graph
+            # (seen for real: a SIM-swap-recency check gating whether to
+            # create vs. extend a completely unrelated QoS session). Reject
+            # the whole branch and fall back to ordinary planning rather
+            # than executing a plan whose two halves have no real
+            # dependency on each other.
+            related = resolver_fact_set & (
+                default_requires | default_produces | other_requires | other_produces
+            )
+            if not related:
+                return None
+
+        step0 = PlanStep(
+            index=0,
+            operation_id=resolver_id,
+            method=resolver_op.method,
+            path=resolver_op.path,
+            requires=resolver_requires,
+            produces=resolver_produces,
+            rationale=f"precondition check - {brief.get('reason')}".rstrip(" -")
+            if brief.get("reason")
+            else "precondition check",
+        )
+
+        known_after_resolver = initial_facts | set(resolver_produces)
+
+        default_plan = self.plan(
+            PlanRequest(
+                intent=request.intent,
+                candidate_operations=[default_op],
+                known_facts=dict.fromkeys(known_after_resolver, True),
+                max_steps=request.max_steps,
+            )
+        )
+        if default_plan.status not in (PlanStatus.VALID, PlanStatus.DRAFT) or not default_plan.steps:
+            return None
+
+        other_steps_dump: list[dict] | None = None
+        if other_id is not None:
+            other_op = operations_by_id[other_id]
+            other_plan = self.plan(
+                PlanRequest(
+                    intent=request.intent,
+                    candidate_operations=[other_op],
+                    known_facts=dict.fromkeys(initial_facts, True),
+                    max_steps=request.max_steps,
+                )
+            )
+            if other_plan.status in (PlanStatus.VALID, PlanStatus.DRAFT) and other_plan.steps:
+                other_steps_dump = [s.model_dump(mode="json") for s in other_plan.steps]
+            else:
+                # The fallback branch doesn't plan at all - still proceed with
+                # the default branch (better than refusing the whole request
+                # over a branch that may never actually be needed), but the
+                # executor will have nothing to splice in if it is needed.
+                warnings.append(
+                    f"{other_id}: could not be planned as the fallback branch "
+                    f"({other_plan.status.value}); it will fail at execution "
+                    "time if the check ever selects it"
+                )
+
+        branch_meta = {
+            "mode": mode,
+            "resolver_operation": resolver_id,
+            "resolver_step_index": 0,
+            "resolver_produces": resolver_produces,
+            # Reported from `default_id`/`other_id`, not re-read from the
+            # original `brief` - if the backwards-assignment check above
+            # swapped them, the brief's own fields are stale and would
+            # describe the plan this method decided *against* building.
+            "if_resolved_operation": default_id if mode == "alternative" else None,
+            "if_unresolved_operation": other_id if mode == "alternative" else None,
+            "gated_operation": brief.get("gated_operation"),
+            "reason": brief.get("reason"),
+            "alt_steps": other_steps_dump,
+        }
+
+        # `default_plan` was solved in isolation (known_after_resolver just
+        # says "qos.session.id is available", not "step 0 produces it") -
+        # its own steps therefore carry no PRIOR_STEP binding back to the
+        # resolver, exactly the "fully-chained plan still stops for
+        # clarification" gap _build_steps's own binding pass exists to
+        # avoid. Redo that same pass here across the spliced-in sequence, so
+        # a parameter step 0 actually supplies (sessionId, from
+        # qos.session.id) is recognised as bound, not re-requested.
+        fact_producer: dict[str, int] = dict.fromkeys(resolver_produces, 0)
+        steps = [step0]
+        for offset, sub_step in enumerate(default_plan.steps):
+            depends_on = [d + 1 for d in sub_step.depends_on]
+            index = offset + 1
+            if offset == 0:
+                depends_on = sorted({*depends_on, 0})
+
+            bindings = list(sub_step.bindings)
+            bound_params = {b.parameter for b in bindings}
+            for fact in sub_step.requires:
+                producer_index = fact_producer.get(fact)
+                if producer_index is None:
+                    continue
+                parameter = parameter_for_fact(fact)
+                if parameter is None or parameter in bound_params:
+                    continue
+                bindings.append(
+                    ParameterBinding(
+                        parameter=parameter,
+                        source=BindingSource.PRIOR_STEP,
+                        from_step=producer_index,
+                    )
+                )
+                bound_params.add(parameter)
+                depends_on = sorted({*depends_on, producer_index})
+
+            steps.append(
+                sub_step.model_copy(
+                    update={"index": index, "depends_on": depends_on, "bindings": bindings}
+                )
+            )
+            for fact in sub_step.produces:
+                fact_producer.setdefault(fact, index)
+
+        # Tag every spliced-in step of the default branch, not just the
+        # first: whichever one the executor reaches first still carries
+        # enough information to splice in the alternate branch from there.
+        steps[1:] = [s.model_copy(update={"precondition_branch": branch_meta}) for s in steps[1:]]
+
+        return PlanResult(
+            status=PlanStatus.VALID,
+            steps=steps,
+            warnings=[*warnings, *default_plan.warnings],
+            rationale=brief.get("reason"),
+            metadata={
+                "initial_facts": sorted(initial_facts),
+                "precondition_branch": branch_meta,
+            },
+        )
 
     # -- goal derivation -----------------------------------------------------
 
